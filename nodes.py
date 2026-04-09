@@ -1368,6 +1368,33 @@ class WanVideoAnimateEmbeds:
 
         return (image_embeds,)
 
+class WanVideoAnimateRefSwap:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "embeds": ("WANVIDIMAGE_EMBEDS",),
+            "ref_image": ("IMAGE", {"tooltip": "New reference image to swap to at the specified frame"}),
+            "swap_frame": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Frame number at which to start using this reference image"}),
+        }}
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+
+    def process(self, embeds, ref_image, swap_frame):
+        updated = dict(embeds)
+        if "ref_swaps" not in updated:
+            updated["ref_swaps"] = []
+        else:
+            updated["ref_swaps"] = list(updated["ref_swaps"])
+        updated["ref_swaps"].append({
+            "ref_image": ref_image,
+            "swap_frame": swap_frame,
+        })
+        updated["ref_swaps"].sort(key=lambda x: x["swap_frame"])
+        return (updated,)
+
 # region UniLumos
 class WanVideoUniLumosEmbeds:
     @classmethod
@@ -2324,6 +2351,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoRoPEFunction": WanVideoRoPEFunction,
     "WanVideoAddPusaNoise": WanVideoAddPusaNoise,
     "WanVideoAnimateEmbeds": WanVideoAnimateEmbeds,
+    "WanVideoAnimateRefSwap": WanVideoAnimateRefSwap,
     "WanVideoAddLucyEditLatents": WanVideoAddLucyEditLatents,
     "WanVideoAddBindweaveEmbeds": WanVideoAddBindweaveEmbeds,
     "TextImageEncodeQwenVL": TextImageEncodeQwenVL,
@@ -2367,6 +2395,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoRoPEFunction": "WanVideo RoPE Function",
     "WanVideoAddPusaNoise": "WanVideo Add Pusa Noise",
     "WanVideoAnimateEmbeds": "WanVideo Animate Embeds",
+    "WanVideoAnimateRefSwap": "WanVideo Animate Ref Swap",
     "WanVideoAddLucyEditLatents": "WanVideo Add LucyEdit Latents",
     "WanVideoAddBindweaveEmbeds": "WanVideo Add Bindweave Embeds",
     "WanVideoUniLumosEmbeds": "WanVideo UniLumos Embeds",

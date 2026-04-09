@@ -2203,6 +2203,7 @@ class WanVideoSampler:
 
                         ref_latent = image_embeds.get("ref_latent", None)
                         ref_images = image_embeds.get("ref_image", None)
+                        ref_swaps = image_embeds.get("ref_swaps", [])
                         bg_images = image_embeds.get("bg_images", None)
                         pose_images = image_embeds.get("pose_images", None)
 
@@ -2236,6 +2237,7 @@ class WanVideoSampler:
                         start = start_latent = img_counter = step_iteration_count = iteration_count = 0
                         end = frame_window_size
                         end_latent = latent_window_size
+                        active_swap_idx = -1
 
 
                         callback = prepare_callback(patcher, estimated_iterations)
@@ -2248,6 +2250,30 @@ class WanVideoSampler:
                                 break
 
                             mm.soft_empty_cache()
+
+                            # ref swap check
+                            if ref_swaps:
+                                new_swap_idx = active_swap_idx
+                                for swap_i, swap in enumerate(ref_swaps):
+                                    if swap["swap_frame"] <= start:
+                                        new_swap_idx = swap_i
+                                if new_swap_idx != active_swap_idx:
+                                    active_swap_idx = new_swap_idx
+                                    swap_ref_img = ref_swaps[active_swap_idx]["ref_image"]
+                                    from comfy.utils import common_upscale
+                                    H_full, W_full = lat_h * 8, lat_w * 8
+                                    if swap_ref_img.shape[1] != H_full or swap_ref_img.shape[2] != W_full:
+                                        swap_ref_img = common_upscale(swap_ref_img.movedim(-1, 1), W_full, H_full, "lanczos", "disabled").movedim(0, 1)
+                                    else:
+                                        swap_ref_img = swap_ref_img.permute(3, 0, 1, 2)
+                                    swap_ref_img = swap_ref_img[:3] * 2 - 1
+                                    vae.to(device)
+                                    swap_ref_encoded = vae.encode([swap_ref_img.to(device, vae.dtype)], device, tiled=tiled_vae)[0]
+                                    swap_msk = torch.zeros(4, 1, lat_h, lat_w, device=device, dtype=vae.dtype)
+                                    swap_msk[:, :1] = 1
+                                    ref_latent = torch.cat([swap_msk, swap_ref_encoded], dim=0).to(offload_device)
+                                    ref_images = swap_ref_img
+                                    log.info(f"WanAnimate: Swapped reference image at frame {start} (swap index {active_swap_idx})")
 
                             if current_ref_images is not None:
                                 mask_reft_len = refert_num

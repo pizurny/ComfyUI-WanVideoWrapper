@@ -1374,7 +1374,8 @@ class WanVideoAnimateRefSwap:
         return {"required": {
             "embeds": ("WANVIDIMAGE_EMBEDS",),
             "ref_image": ("IMAGE", {"tooltip": "New reference image to swap to at the specified frame"}),
-            "swap_frame": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Frame number at which to start using this reference image"}),
+            "swap_frame": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Frame at which to start using this reference image. Swaps snap to window boundaries — with frame_window_size=77 the effective boundaries are at frames 0, 77, 153, 229, ... The runtime log reports the actual frame where the swap takes effect."}),
+            "reset_temporal": ("BOOLEAN", {"default": False, "tooltip": "If True, breaks temporal continuity at the swap by reseeding the temporal reference with the new ref image itself, giving a hard identity cut instead of a morph from the prior window's last frame."}),
         }}
 
     RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
@@ -1382,7 +1383,7 @@ class WanVideoAnimateRefSwap:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, embeds, ref_image, swap_frame):
+    def process(self, embeds, ref_image, swap_frame, reset_temporal):
         updated = dict(embeds)
         if "ref_swaps" not in updated:
             updated["ref_swaps"] = []
@@ -1391,6 +1392,7 @@ class WanVideoAnimateRefSwap:
         updated["ref_swaps"].append({
             "ref_image": ref_image,
             "swap_frame": swap_frame,
+            "reset_temporal": reset_temporal,
         })
         updated["ref_swaps"].sort(key=lambda x: x["swap_frame"])
         return (updated,)

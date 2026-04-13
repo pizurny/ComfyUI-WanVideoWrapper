@@ -18,7 +18,7 @@ from .WanMove.trajectory import replace_feature
 from contextlib import nullcontext
 
 from comfy import model_management as mm
-from comfy.utils import ProgressBar
+from comfy.utils import ProgressBar, common_upscale
 from comfy.cli_args import args, LatentPreviewMethod
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
@@ -2259,9 +2259,9 @@ class WanVideoSampler:
                                         new_swap_idx = swap_i
                                 if new_swap_idx != active_swap_idx:
                                     active_swap_idx = new_swap_idx
-                                    swap_ref_img = ref_swaps[active_swap_idx]["ref_image"]
-                                    from comfy.utils import common_upscale
-                                    H_full, W_full = lat_h * 8, lat_w * 8
+                                    current_swap = ref_swaps[active_swap_idx]
+                                    swap_ref_img = current_swap["ref_image"]
+                                    H_full, W_full = lat_h * vae_upscale_factor, lat_w * vae_upscale_factor
                                     if swap_ref_img.shape[1] != H_full or swap_ref_img.shape[2] != W_full:
                                         swap_ref_img = common_upscale(swap_ref_img.movedim(-1, 1), W_full, H_full, "lanczos", "disabled").movedim(0, 1)
                                     else:
@@ -2273,7 +2273,10 @@ class WanVideoSampler:
                                     swap_msk[:, :1] = 1
                                     ref_latent = torch.cat([swap_msk, swap_ref_encoded], dim=0).to(offload_device)
                                     ref_images = swap_ref_img
-                                    log.info(f"WanAnimate: Swapped reference image at frame {start} (swap index {active_swap_idx})")
+                                    if current_swap.get("reset_temporal", False):
+                                        current_ref_images = swap_ref_img.clone().to(offload_device)
+                                    effective_frame = start if start == 0 else start + refert_num
+                                    log.info(f"WanAnimate: Swapped reference image (swap index {active_swap_idx}, requested frame {current_swap['swap_frame']}, effective first output frame {effective_frame})")
 
                             if current_ref_images is not None:
                                 mask_reft_len = refert_num

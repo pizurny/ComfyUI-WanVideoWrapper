@@ -1209,6 +1209,7 @@ class WanVideoAnimateEmbeds:
                 "mask": ("MASK", {"tooltip": "mask"}),
                 "start_ref_image": ("IMAGE", {"tooltip": "start ref image"}),
                 "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
+                "force_looping": ("BOOLEAN", {"default": False, "tooltip": "Force the sampler into the looping/windowed path even when num_frames <= frame_window_size. Required when using WanVideoAnimateRefSwap on short videos where the swap boundary would otherwise fall inside a single non-looping window."}),
             }
         }
 
@@ -1218,8 +1219,8 @@ class WanVideoAnimateEmbeds:
     CATEGORY = "WanVideoWrapper"
 
     def process(self, vae, width, height, num_frames, force_offload, frame_window_size, colormatch, pose_strength, face_strength,
-                ref_images=None, pose_images=None, face_images=None, clip_embeds=None, tiled_vae=False, bg_images=None, mask=None, start_ref_image=None):
-        
+                ref_images=None, pose_images=None, face_images=None, clip_embeds=None, tiled_vae=False, bg_images=None, mask=None, start_ref_image=None, force_looping=False):
+
         W = (width // 16) * 16
         H = (height // 16) * 16
 
@@ -1229,7 +1230,7 @@ class WanVideoAnimateEmbeds:
         num_refs = ref_images.shape[0] if ref_images is not None else 0
         num_frames = ((num_frames - 1) // 4) * 4 + 1
 
-        looping = num_frames > frame_window_size or start_ref_image is not None
+        looping = num_frames > frame_window_size or start_ref_image is not None or force_looping
 
         if num_frames < frame_window_size:
             frame_window_size = num_frames
@@ -1374,7 +1375,7 @@ class WanVideoAnimateRefSwap:
         return {"required": {
             "embeds": ("WANVIDIMAGE_EMBEDS",),
             "ref_image": ("IMAGE", {"tooltip": "New reference image to swap to at the specified frame"}),
-            "swap_frame": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Frame at which to start using this reference image. Swaps snap to window boundaries — with frame_window_size=77 the effective boundaries are at frames 0, 77, 153, 229, ... The runtime log reports the actual frame where the swap takes effect."}),
+            "swap_frame": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Output frame at which to start using this reference image. The sampler forces a new window boundary at this frame so the swap is frame-accurate (modulo VAE 4-frame latent quantization). Requires looping mode on WanVideoAnimateEmbeds (num_frames > frame_window_size OR force_looping=True)."}),
             "reset_temporal": ("BOOLEAN", {"default": False, "tooltip": "If True, breaks temporal continuity at the swap by reseeding the temporal reference with the new ref image itself, giving a hard identity cut instead of a morph from the prior window's last frame."}),
         }}
 
@@ -1395,6 +1396,8 @@ class WanVideoAnimateRefSwap:
             "reset_temporal": reset_temporal,
         })
         updated["ref_swaps"].sort(key=lambda x: x["swap_frame"])
+        if not updated.get("looping", False):
+            log.warning("WanVideoAnimateRefSwap: upstream WanVideoAnimateEmbeds is not in looping mode — the ref swap will be IGNORED at sample time. Enable 'force_looping' on WanVideoAnimateEmbeds, or ensure num_frames > frame_window_size.")
         return (updated,)
 
 # region UniLumos

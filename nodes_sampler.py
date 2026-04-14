@@ -2213,6 +2213,51 @@ class WanVideoSampler:
                                 "WanAnimate: Detected manual start reference image, enabling continuous generation across windows.")
                         face_images = face_images_in = None
 
+                        # Variable-window gating (built before pingpong pads so we can expand target_len if the schedule needs it).
+                        prev_active_ref_idx = -1
+                        use_variable_windows = (
+                            bool(ref_swaps)
+                            and wananim_ref_masks is None
+                            and samples is None
+                            and uni3c_embeds is None
+                            and current_ref_images is None  # start_ref_image path uses special first-iter handling
+                        )
+                        if ref_swaps and not use_variable_windows:
+                            log.warning("WanAnimate: ref_swaps present but falling back to fixed-window stride because ref_masks / input samples / uni3c / start_ref_image are in use.")
+
+                        window_schedule = []
+                        if use_variable_windows:
+                            _forced = sorted({s["swap_frame"] for s in ref_swaps if 0 < s["swap_frame"] < total_frames})
+                            _boundaries = [0] + _forced + [total_frames]
+                            for _bi in range(len(_boundaries) - 1):
+                                _seg_start = _boundaries[_bi]
+                                _seg_end = _boundaries[_bi + 1]
+                                _active = -1
+                                for _swap_i, _swap in enumerate(ref_swaps):
+                                    if _swap["swap_frame"] <= _seg_start:
+                                        _active = _swap_i
+                                _cur = _seg_start
+                                while _cur < _seg_end:
+                                    _is_first_ever = (len(window_schedule) == 0)
+                                    _max_out = frame_window_size if _is_first_ever else (frame_window_size - refert_num)
+                                    _out_size = min(_max_out, _seg_end - _cur)
+                                    window_schedule.append((_cur, _cur + _out_size, _active))
+                                    _cur += _out_size
+                            # Compute the widest end-of-window we will slice into, accounting for VAE-aligned rounding up.
+                            _max_sched_end = 0
+                            for _i, (_os, _oe, _) in enumerate(window_schedule):
+                                _is_first = (_i == 0)
+                                _win_in_start = _os if _is_first else _os - refert_num
+                                _win_sampled = (_oe - _os) if _is_first else (_oe - _os + refert_num)
+                                _win_fws = _win_sampled if (_win_sampled - 1) % 4 == 0 else _win_sampled + (4 - ((_win_sampled - 1) % 4))
+                                _max_sched_end = max(_max_sched_end, _win_in_start + _win_fws)
+                            if _max_sched_end > target_len:
+                                log.info(f"WanAnimate: expanding target_len from {target_len} to {_max_sched_end} to cover variable-window schedule")
+                                target_len = _max_sched_end
+                                target_latent_len = (target_len - 1) // 4 + len(window_schedule)
+                            estimated_iterations = len(window_schedule)
+                            log.info(f"WanAnimate: variable-window schedule with {estimated_iterations} windows from {len(ref_swaps)} swap(s): {[(s, e) for s, e, _ in window_schedule]}")
+
                         if wananim_face_pixels is not None:
                             face_images = tensor_pingpong_pad(wananim_face_pixels, target_len)
                             log.info(f"WanAnimate: Face input {wananim_face_pixels.shape} padded to shape {face_images.shape}")
@@ -2239,6 +2284,11 @@ class WanVideoSampler:
                         end_latent = latent_window_size
                         active_swap_idx = -1
 
+                        # per-iteration aliases; fixed mode keeps these constant
+                        cur_frame_window_size = frame_window_size
+                        cur_latent_window_size = latent_window_size
+                        iter_out_size = None
+                        iter_is_first = True
 
                         callback = prepare_callback(patcher, estimated_iterations)
                         log.info(f"Sampling {total_frames} frames in {estimated_iterations} windows, at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps} steps")
@@ -2246,13 +2296,52 @@ class WanVideoSampler:
                         # outer WanAnimate loop
                         gen_video_list = []
                         while True:
-                            if start + refert_num >= total_frames:
-                                break
+                            if use_variable_windows:
+                                if iteration_count >= len(window_schedule):
+                                    break
+                                iter_out_start, iter_out_end, iter_active_ref = window_schedule[iteration_count]
+                                iter_out_size = iter_out_end - iter_out_start
+                                iter_is_first = (iteration_count == 0)
+                                if iter_is_first:
+                                    start = iter_out_start
+                                    _sampled = iter_out_size
+                                else:
+                                    start = iter_out_start - refert_num
+                                    _sampled = iter_out_size + refert_num
+                                cur_frame_window_size = _sampled if (_sampled - 1) % 4 == 0 else _sampled + (4 - ((_sampled - 1) % 4))
+                                cur_latent_window_size = (cur_frame_window_size - 1) // 4 + 1
+                                end = start + cur_frame_window_size
+                            else:
+                                if start + refert_num >= total_frames:
+                                    break
+                                cur_frame_window_size = frame_window_size
+                                cur_latent_window_size = latent_window_size
 
                             mm.soft_empty_cache()
 
-                            # ref swap check
-                            if ref_swaps:
+                            # ref swap application
+                            if use_variable_windows:
+                                if iter_active_ref != prev_active_ref_idx:
+                                    prev_active_ref_idx = iter_active_ref
+                                    if iter_active_ref >= 0:
+                                        current_swap = ref_swaps[iter_active_ref]
+                                        swap_ref_img = current_swap["ref_image"]
+                                        H_full, W_full = lat_h * vae_upscale_factor, lat_w * vae_upscale_factor
+                                        if swap_ref_img.shape[1] != H_full or swap_ref_img.shape[2] != W_full:
+                                            swap_ref_img = common_upscale(swap_ref_img.movedim(-1, 1), W_full, H_full, "lanczos", "disabled").movedim(0, 1)
+                                        else:
+                                            swap_ref_img = swap_ref_img.permute(3, 0, 1, 2)
+                                        swap_ref_img = swap_ref_img[:3] * 2 - 1
+                                        vae.to(device)
+                                        swap_ref_encoded = vae.encode([swap_ref_img.to(device, vae.dtype)], device, tiled=tiled_vae)[0]
+                                        swap_msk = torch.zeros(4, 1, lat_h, lat_w, device=device, dtype=vae.dtype)
+                                        swap_msk[:, :1] = 1
+                                        ref_latent = torch.cat([swap_msk, swap_ref_encoded], dim=0).to(offload_device)
+                                        ref_images = swap_ref_img
+                                        if current_swap.get("reset_temporal", False):
+                                            current_ref_images = swap_ref_img.clone().to(offload_device)
+                                        log.info(f"WanAnimate: Applying ref swap idx {iter_active_ref} (requested frame {current_swap['swap_frame']}, window starts at output frame {iter_out_start})")
+                            elif ref_swaps:
                                 new_swap_idx = active_swap_idx
                                 for swap_i, swap in enumerate(ref_swaps):
                                     if swap["swap_frame"] <= start:
@@ -2285,7 +2374,7 @@ class WanVideoSampler:
 
                             self.cache_state = [None, None]
 
-                            noise = torch.randn(16, latent_window_size + 1, lat_h, lat_w, dtype=torch.float32, device=torch.device("cpu"), generator=seed_g).to(device)
+                            noise = torch.randn(16, cur_latent_window_size + 1, lat_h, lat_w, dtype=torch.float32, device=torch.device("cpu"), generator=seed_g).to(device)
                             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
 
                             if current_ref_images is not None or bg_images is not None or ref_latent is not None:
@@ -2296,11 +2385,11 @@ class WanVideoSampler:
                                 if wananim_ref_masks is not None:
                                     msk = ref_masks_in[:, start_latent:end_latent].to(device, dtype)
                                 else:
-                                    msk = torch.zeros(4, latent_window_size, lat_h, lat_w, device=device, dtype=dtype)
+                                    msk = torch.zeros(4, cur_latent_window_size, lat_h, lat_w, device=device, dtype=dtype)
                                 if bg_images is not None:
                                     bg_image_slice = bg_images_in[:, start:end].to(device)
                                 else:
-                                    bg_image_slice = torch.zeros(3, frame_window_size-refert_num, lat_h * 8, lat_w * 8, device=device, dtype=vae.dtype)
+                                    bg_image_slice = torch.zeros(3, cur_frame_window_size-refert_num, lat_h * vae_upscale_factor, lat_w * vae_upscale_factor, device=device, dtype=vae.dtype)
                                 if mask_reft_len == 0:
                                     temporal_ref_latents = vae.encode([bg_image_slice], device,tiled=tiled_vae)[0]
                                 else:
@@ -2334,7 +2423,7 @@ class WanVideoSampler:
                             vae.to(offload_device)
 
                             if wananim_face_pixels is None and wananim_ref_masks is not None:
-                                face_images_in = torch.zeros(1, 3, frame_window_size, 512, 512, device=device, dtype=torch.float32)
+                                face_images_in = torch.zeros(1, 3, cur_frame_window_size, 512, 512, device=device, dtype=torch.float32)
                             elif wananim_face_pixels is not None:
                                 face_images_in = face_images[:, :, start:end].to(device, torch.float32) if face_images is not None else None
 
@@ -2460,8 +2549,14 @@ class WanVideoSampler:
                             videos = vae.decode(latent[:, 1:].unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
                             del latent
 
-                            if start != 0 or current_ref_images is not None:
-                                videos = videos[:, refert_num:]
+                            if use_variable_windows:
+                                if not iter_is_first:
+                                    videos = videos[:, refert_num:]
+                                if iter_out_size is not None and videos.shape[1] > iter_out_size:
+                                    videos = videos[:, :iter_out_size]
+                            else:
+                                if start != 0 or current_ref_images is not None:
+                                    videos = videos[:, refert_num:]
 
                             sampling_pbar.close()
 
@@ -2495,10 +2590,11 @@ class WanVideoSampler:
                             del videos
 
                             iteration_count += 1
-                            start += frame_window_size - refert_num
-                            end += frame_window_size - refert_num
-                            start_latent += latent_window_size - ((refert_num - 1)// 4 + 1)
-                            end_latent += latent_window_size - ((refert_num - 1)// 4 + 1)
+                            if not use_variable_windows:
+                                start += frame_window_size - refert_num
+                                end += frame_window_size - refert_num
+                                start_latent += latent_window_size - ((refert_num - 1)// 4 + 1)
+                                end_latent += latent_window_size - ((refert_num - 1)// 4 + 1)
 
                         if not output_path:
                             gen_video_samples = torch.cat(gen_video_list, dim=1)

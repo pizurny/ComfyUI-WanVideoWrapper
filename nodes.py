@@ -1376,7 +1376,8 @@ class WanVideoAnimateRefSwap:
             "embeds": ("WANVIDIMAGE_EMBEDS",),
             "ref_image": ("IMAGE", {"tooltip": "New reference image to swap to at the specified frame"}),
             "swap_frame": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Output frame at which to start using this reference image. The sampler forces a new window boundary at this frame so the swap is frame-accurate (modulo VAE 4-frame latent quantization). Requires looping mode on WanVideoAnimateEmbeds (num_frames > frame_window_size OR force_looping=True)."}),
-            "reset_temporal": ("BOOLEAN", {"default": False, "tooltip": "If True, breaks temporal continuity at the swap by reseeding the temporal reference with the new ref image itself, giving a hard identity cut instead of a morph from the prior window's last frame."}),
+            "reset_temporal": ("BOOLEAN", {"default": False, "tooltip": "If True, breaks temporal continuity at the swap by reseeding the temporal reference with the new ref image itself, giving a hard identity cut instead of a morph from the prior window's last frame. Applies only at the full-swap boundary, not during a blended transition."}),
+            "transition_frames": ("INT", {"default": 0, "min": 0, "max": 500, "step": 1, "tooltip": "If > 0, the sampler inserts N intermediate micro-windows before swap_frame (over this many output frames), each using a linearly-blended ref latent mixing the prior and new ref. Creates a smooth identity transition. Zero = hard swap at swap_frame (default). Ignored when the sampler falls back to fixed windows (masks / uni3c / start_ref_image / input samples in use)."}),
         }}
 
     RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
@@ -1384,7 +1385,7 @@ class WanVideoAnimateRefSwap:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, embeds, ref_image, swap_frame, reset_temporal):
+    def process(self, embeds, ref_image, swap_frame, reset_temporal, transition_frames):
         updated = dict(embeds)
         if "ref_swaps" not in updated:
             updated["ref_swaps"] = []
@@ -1394,6 +1395,7 @@ class WanVideoAnimateRefSwap:
             "ref_image": ref_image,
             "swap_frame": swap_frame,
             "reset_temporal": reset_temporal,
+            "transition_frames": transition_frames,
         })
         updated["ref_swaps"].sort(key=lambda x: x["swap_frame"])
         if not updated.get("looping", False):

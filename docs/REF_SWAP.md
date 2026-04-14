@@ -39,13 +39,14 @@ Adds a new reference image that takes effect at a chosen output frame. Chainable
 | `embeds` | `WANVIDIMAGE_EMBEDS` | — | Upstream `WanVideoAnimateEmbeds` (or another swap node). |
 | `ref_image` | `IMAGE` | — | New reference image that will drive generation from `swap_frame` onward. Should match the width/height of the original ref. |
 | `swap_frame` | `INT` | `0` | Output frame at which the new reference takes over. The sampler forces a window boundary here and starts using `ref_image` as the static reference from this frame. |
-| `reset_temporal` | `BOOLEAN` | `False` | If `True`, clears the temporal seed from the prior window so the new identity starts cleanly instead of morphing from the old identity's last frame. Use for hard character cuts. |
+| `reset_temporal` | `BOOLEAN` | `False` | If `True`, clears the temporal seed from the prior window so the new identity starts cleanly instead of morphing from the old identity's last frame. Use for hard character cuts. Only applied at the full-swap boundary, not during a blended transition. |
+| `transition_frames` | `INT` | `0` | If `> 0`, the sampler inserts N intermediate micro-windows over this many output frames ending at `swap_frame`, each using a linearly-blended ref latent. `0` = hard swap (default). See [Smooth transitions](#smooth-transitions) below. |
 
 **Output:** `image_embeds` — extended dict carrying a sorted `ref_swaps` list. Pass to the next swap node or directly to `WanVideoSampler`.
 
 ### Chaining semantics
 
-Multiple swap nodes produce a list of entries in `image_embeds["ref_swaps"]`, sorted by `swap_frame`. Each entry is `{ref_image, swap_frame, reset_temporal}`. The sampler consumes this list to build a window schedule.
+Multiple swap nodes produce a list of entries in `image_embeds["ref_swaps"]`, sorted by `swap_frame`. Each entry is `{ref_image, swap_frame, reset_temporal, transition_frames}`. The sampler consumes this list to build a window schedule.
 
 ### Requirements
 
@@ -124,6 +125,53 @@ Leave `reset_temporal=False` for:
 
 - Same character, different wardrobe / lighting / expression.
 - Smooth morphs between similar identities.
+
+When combined with `transition_frames > 0`, `reset_temporal` is applied **only at the full-swap boundary** (the window where `apply_weight` reaches 1.0), not during the blend. The blend windows use whatever temporal seed the prior window produced, and the hard cut (if any) happens at the end of the transition.
+
+---
+
+## Smooth transitions
+
+`transition_frames` lets you dial in a gradual identity shift instead of an abrupt swap. When `> 0`, the sampler inserts `N` intermediate **micro-windows** ending at `swap_frame`, each using a linearly-blended `ref_latent` mixing the prior ref and the new ref:
+
+- `N = max(1, min(5, round(transition_frames / 10)))` — roughly one micro-window per 10 output frames, capped at 5.
+- Each micro-window `k ∈ [0, N)` covers `(transition_frames / N)` output frames and uses `apply_weight = (k + 1) / (N + 1)`, so weights land at evenly-spaced linear points in `(0, 1)` (e.g. for `N=2`: `[1/3, 2/3]`; for `N=5`: `[1/6, 2/6, 3/6, 4/6, 5/6]`).
+- The final `apply_weight = 1.0` window starts exactly at `swap_frame`, where `ref_latent` is permanently replaced by the new ref's latent and `reset_temporal` (if set) takes effect.
+
+The mixing happens **in VAE latent space** — the old and new ref latents are linearly interpolated and fed into `image_cond_in` for that iteration only. `ref_latent` itself isn't overwritten until the full-swap window, so subsequent transition windows can continue to interpolate from the original.
+
+### Worked example — smooth transition
+
+`num_frames=120`, `swap_frame=100`, `transition_frames=20`, `frame_window_size=77`:
+
+`N = round(20 / 10) = 2` micro-windows, each 10 frames, covering `[80, 100)`.
+
+Quantized `num_frames` → 117. Boundaries: `[0, 80, 90, 100, 117]`.
+
+| iter | window | target | `apply_weight` | ref_latent used |
+|------|--------|--------|----------------|-----------------|
+| 0 | `(0, 77)` | — | — | `ref_A` (original) |
+| 1 | `(77, 80)` | — | — | `ref_A` (original, small window to align with transition start) |
+| 2 | `(80, 90)` | swap 0 | `1/3` | `2/3 · ref_A + 1/3 · ref_B` |
+| 3 | `(90, 100)` | swap 0 | `2/3` | `1/3 · ref_A + 2/3 · ref_B` |
+| 4 | `(100, 117)` | swap 0 | `1.0` | `ref_B` (persisted; `reset_temporal` applies here if set) |
+
+Expected log output during sampling:
+```
+WanAnimate: variable-window schedule with 5 windows from 1 swap(s): [(0, 77, -1, 0.0), (77, 80, -1, 0.0), (80, 90, 0, 0.333), (90, 100, 0, 0.667), (100, 117, 0, 1.0)]
+WanAnimate: Encoded new ref for swap idx 0
+WanAnimate: Blending toward ref swap idx 0 at weight 0.333 (window 80-90)
+WanAnimate: Blending toward ref swap idx 0 at weight 0.667 (window 90-100)
+WanAnimate: Applying ref swap idx 0 fully (window starts at output frame 100, requested swap_frame 100)
+```
+
+### Transition caveats
+
+- **Latent linear interpolation isn't semantically guaranteed.** For very similar poses and lighting, the blend produces a smooth identity shift. For drastically different subjects (different species, lighting, camera angle) the intermediate latents can look noisy or uncanny. Test with your actual refs.
+- **Transition micro-windows can be small.** For `transition_frames ≤ 10`, you get one 1-window blend that's roughly the full transition length. For larger values, the sampler divides into multiple steps but each is still limited by VAE latent quantization (rounded up to `4k+1`). Very short micro-windows (< 5 frames) give the transformer limited temporal context.
+- **Overlapping transitions are not supported.** If two swaps' transition regions would overlap (e.g. swap A at frame 50 with `transition_frames=30`, swap B at frame 65 with `transition_frames=30`), the sampler logs a warning and drops the later swap's transition (B becomes a hard swap).
+- **Clamped at frame 0.** If `swap_frame - transition_frames < 0`, the transition starts at frame 0 and is truncated.
+- **Fallback mode ignores it.** `transition_frames` has no effect when the sampler falls back to fixed windows (see [Fallback rules](#fallback-rules)).
 
 ---
 

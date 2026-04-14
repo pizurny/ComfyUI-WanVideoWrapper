@@ -2214,7 +2214,10 @@ class WanVideoSampler:
                         face_images = face_images_in = None
 
                         # Variable-window gating (built before pingpong pads so we can expand target_len if the schedule needs it).
-                        prev_active_ref_idx = -1
+                        prev_target_ref_idx = -1
+                        old_ref_latent_snapshot = None
+                        new_ref_latent_cache = {}
+                        new_ref_img_cache = {}
                         use_variable_windows = (
                             bool(ref_swaps)
                             and wananim_ref_masks is None
@@ -2227,25 +2230,87 @@ class WanVideoSampler:
 
                         window_schedule = []
                         if use_variable_windows:
-                            _forced = sorted({s["swap_frame"] for s in ref_swaps if 0 < s["swap_frame"] < total_frames})
-                            _boundaries = [0] + _forced + [total_frames]
+                            # Step 1: build per-swap transition micro-segments (one entry per micro-window inside the transition region).
+                            # Each transition_segments entry: (seg_start, seg_end, target_swap_idx, weight in (0,1)).
+                            transition_segments = []
+                            _used_ranges = []  # list of (start, end, swap_idx) already-claimed transition ranges (for overlap detection)
+                            for _swap_i, _swap in enumerate(ref_swaps):
+                                _tf = int(_swap.get("transition_frames", 0) or 0)
+                                _sf = _swap["swap_frame"]
+                                if _tf <= 0 or _sf <= 0 or _sf >= total_frames:
+                                    continue
+                                _trans_start = max(0, _sf - _tf)
+                                _trans_end = _sf
+                                # Overlap check against existing ranges
+                                _overlap = False
+                                for _r_start, _r_end, _r_swap_i in _used_ranges:
+                                    if _trans_start < _r_end and _trans_end > _r_start:
+                                        log.warning(f"WanAnimate: transition for swap {_swap_i} (frames {_trans_start}-{_trans_end}) overlaps swap {_r_swap_i}'s transition — dropping this transition, hard swap will be used.")
+                                        _overlap = True
+                                        break
+                                if _overlap:
+                                    continue
+                                _used_ranges.append((_trans_start, _trans_end, _swap_i))
+                                _N = max(1, min(5, int(round(_tf / 10))))
+                                _step = (_trans_end - _trans_start) / _N
+                                for _k in range(_N):
+                                    _seg_start = int(round(_trans_start + _k * _step))
+                                    _seg_end = int(round(_trans_start + (_k + 1) * _step))
+                                    if _seg_end <= _seg_start:
+                                        continue
+                                    _weight = (_k + 1) / (_N + 1)
+                                    transition_segments.append((_seg_start, _seg_end, _swap_i, _weight))
+
+                            # Step 2: build master boundary list (hard swap frames + transition segment edges).
+                            _forced = set()
+                            for _s in ref_swaps:
+                                if 0 < _s["swap_frame"] < total_frames:
+                                    _forced.add(_s["swap_frame"])
+                            for _ts, _te, _, _ in transition_segments:
+                                if 0 < _ts < total_frames:
+                                    _forced.add(_ts)
+                                if 0 < _te < total_frames:
+                                    _forced.add(_te)
+                            _boundaries = sorted([0] + list(_forced) + [total_frames])
+
+                            # Step 3: for each (boundary[i], boundary[i+1]) pair, determine target_ref_idx and apply_weight,
+                            # then sub-divide into windows of at most frame_window_size output frames.
+                            def _lookup_weight(_mid_frame):
+                                # Returns (target_swap_idx, weight) for a given midpoint; None if no transition covers it.
+                                for _ts, _te, _swap_i, _w in transition_segments:
+                                    if _ts <= _mid_frame < _te:
+                                        return (_swap_i, _w)
+                                return None
+
                             for _bi in range(len(_boundaries) - 1):
                                 _seg_start = _boundaries[_bi]
                                 _seg_end = _boundaries[_bi + 1]
-                                _active = -1
-                                for _swap_i, _swap in enumerate(ref_swaps):
-                                    if _swap["swap_frame"] <= _seg_start:
-                                        _active = _swap_i
+                                if _seg_start >= _seg_end:
+                                    continue
+                                _mid = (_seg_start + _seg_end) / 2
+                                _trans_info = _lookup_weight(_mid)
+                                if _trans_info is not None:
+                                    _target_ref = _trans_info[0]
+                                    _apply_weight = _trans_info[1]
+                                else:
+                                    # Not in a transition — determine which fully-applied swap is active.
+                                    _active = -1
+                                    for _swap_i, _swap in enumerate(ref_swaps):
+                                        if _swap["swap_frame"] <= _seg_start:
+                                            _active = _swap_i
+                                    _target_ref = _active
+                                    _apply_weight = 1.0 if _active >= 0 else 0.0  # 0.0 = no swap at all
                                 _cur = _seg_start
                                 while _cur < _seg_end:
                                     _is_first_ever = (len(window_schedule) == 0)
                                     _max_out = frame_window_size if _is_first_ever else (frame_window_size - refert_num)
                                     _out_size = min(_max_out, _seg_end - _cur)
-                                    window_schedule.append((_cur, _cur + _out_size, _active))
+                                    window_schedule.append((_cur, _cur + _out_size, _target_ref, _apply_weight))
                                     _cur += _out_size
+
                             # Compute the widest end-of-window we will slice into, accounting for VAE-aligned rounding up.
                             _max_sched_end = 0
-                            for _i, (_os, _oe, _) in enumerate(window_schedule):
+                            for _i, (_os, _oe, _, _) in enumerate(window_schedule):
                                 _is_first = (_i == 0)
                                 _win_in_start = _os if _is_first else _os - refert_num
                                 _win_sampled = (_oe - _os) if _is_first else (_oe - _os + refert_num)
@@ -2256,7 +2321,8 @@ class WanVideoSampler:
                                 target_len = _max_sched_end
                                 target_latent_len = (target_len - 1) // 4 + len(window_schedule)
                             estimated_iterations = len(window_schedule)
-                            log.info(f"WanAnimate: variable-window schedule with {estimated_iterations} windows from {len(ref_swaps)} swap(s): {[(s, e) for s, e, _ in window_schedule]}")
+                            _sched_pretty = [(s, e, r, round(w, 3)) for s, e, r, w in window_schedule]
+                            log.info(f"WanAnimate: variable-window schedule with {estimated_iterations} windows from {len(ref_swaps)} swap(s): {_sched_pretty}")
 
                         if wananim_face_pixels is not None:
                             face_images = tensor_pingpong_pad(wananim_face_pixels, target_len)
@@ -2299,7 +2365,7 @@ class WanVideoSampler:
                             if use_variable_windows:
                                 if iteration_count >= len(window_schedule):
                                     break
-                                iter_out_start, iter_out_end, iter_active_ref = window_schedule[iteration_count]
+                                iter_out_start, iter_out_end, iter_target_ref, iter_apply_weight = window_schedule[iteration_count]
                                 iter_out_size = iter_out_end - iter_out_start
                                 iter_is_first = (iteration_count == 0)
                                 if iter_is_first:
@@ -2317,14 +2383,18 @@ class WanVideoSampler:
                                 cur_frame_window_size = frame_window_size
                                 cur_latent_window_size = latent_window_size
 
+                            # Default: this iter uses the persistent ref_latent. Variable-mode transitions may override with a blend.
+                            _iter_ref_latent = ref_latent
+
                             mm.soft_empty_cache()
 
                             # ref swap application
                             if use_variable_windows:
-                                if iter_active_ref != prev_active_ref_idx:
-                                    prev_active_ref_idx = iter_active_ref
-                                    if iter_active_ref >= 0:
-                                        current_swap = ref_swaps[iter_active_ref]
+                                # Detect when we enter a new target ref (start of transition or full-swap sequence)
+                                if iter_target_ref != prev_target_ref_idx and iter_target_ref >= 0:
+                                    old_ref_latent_snapshot = ref_latent.clone() if ref_latent is not None else None
+                                    if iter_target_ref not in new_ref_latent_cache:
+                                        current_swap = ref_swaps[iter_target_ref]
                                         swap_ref_img = current_swap["ref_image"]
                                         H_full, W_full = lat_h * vae_upscale_factor, lat_w * vae_upscale_factor
                                         if swap_ref_img.shape[1] != H_full or swap_ref_img.shape[2] != W_full:
@@ -2336,11 +2406,26 @@ class WanVideoSampler:
                                         swap_ref_encoded = vae.encode([swap_ref_img.to(device, vae.dtype)], device, tiled=tiled_vae)[0]
                                         swap_msk = torch.zeros(4, 1, lat_h, lat_w, device=device, dtype=vae.dtype)
                                         swap_msk[:, :1] = 1
-                                        ref_latent = torch.cat([swap_msk, swap_ref_encoded], dim=0).to(offload_device)
-                                        ref_images = swap_ref_img
-                                        if current_swap.get("reset_temporal", False):
-                                            current_ref_images = swap_ref_img.clone().to(offload_device)
-                                        log.info(f"WanAnimate: Applying ref swap idx {iter_active_ref} (requested frame {current_swap['swap_frame']}, window starts at output frame {iter_out_start})")
+                                        new_ref_latent_cache[iter_target_ref] = torch.cat([swap_msk, swap_ref_encoded], dim=0).to(offload_device)
+                                        new_ref_img_cache[iter_target_ref] = swap_ref_img
+                                        log.info(f"WanAnimate: Encoded new ref for swap idx {iter_target_ref}")
+                                    prev_target_ref_idx = iter_target_ref
+
+                                # Compute effective ref_latent for this iteration
+                                if iter_target_ref >= 0 and 0 < iter_apply_weight < 1 and old_ref_latent_snapshot is not None:
+                                    _new_latent = new_ref_latent_cache[iter_target_ref]
+                                    _old = old_ref_latent_snapshot.to(_new_latent.device)
+                                    _iter_ref_latent = (1.0 - iter_apply_weight) * _old + iter_apply_weight * _new_latent
+                                    log.info(f"WanAnimate: Blending toward ref swap idx {iter_target_ref} at weight {iter_apply_weight:.3f} (window {iter_out_start}-{iter_out_end})")
+                                elif iter_target_ref >= 0 and iter_apply_weight >= 1.0:
+                                    # Full swap — persist the new state
+                                    ref_latent = new_ref_latent_cache[iter_target_ref]
+                                    ref_images = new_ref_img_cache[iter_target_ref]
+                                    current_swap = ref_swaps[iter_target_ref]
+                                    if current_swap.get("reset_temporal", False):
+                                        current_ref_images = new_ref_img_cache[iter_target_ref].clone().to(offload_device)
+                                    log.info(f"WanAnimate: Applying ref swap idx {iter_target_ref} fully (window starts at output frame {iter_out_start}, requested swap_frame {current_swap['swap_frame']})")
+                                    _iter_ref_latent = ref_latent
                             elif ref_swaps:
                                 new_swap_idx = active_swap_idx
                                 for swap_i, swap in enumerate(ref_swaps):
@@ -2366,6 +2451,9 @@ class WanVideoSampler:
                                         current_ref_images = swap_ref_img.clone().to(offload_device)
                                     effective_frame = start if start == 0 else start + refert_num
                                     log.info(f"WanAnimate: Swapped reference image (swap index {active_swap_idx}, requested frame {current_swap['swap_frame']}, effective first output frame {effective_frame})")
+                            # Keep _iter_ref_latent in sync with ref_latent for both modes (variable mode already handled above).
+                            if not use_variable_windows:
+                                _iter_ref_latent = ref_latent
 
                             if current_ref_images is not None:
                                 mask_reft_len = refert_num
@@ -2405,9 +2493,9 @@ class WanVideoSampler:
                                     else:
                                         temporal_ref_latents = temporal_ref_latents[:, :msk.shape[1]]
 
-                                if ref_latent is not None:
+                                if _iter_ref_latent is not None:
                                     temporal_ref_latents = torch.cat([msk, temporal_ref_latents], dim=0) # 4+C T H W
-                                    image_cond_in = torch.cat([ref_latent.to(device), temporal_ref_latents], dim=1) # 4+C T+trefs H W
+                                    image_cond_in = torch.cat([_iter_ref_latent.to(device), temporal_ref_latents], dim=1) # 4+C T+trefs H W
                                     del temporal_ref_latents, msk, bg_image_slice
                                 else:
                                     image_cond_in = torch.cat([torch.tile(torch.zeros_like(noise[:1]), [4, 1, 1, 1]), torch.zeros_like(noise)], dim=0).to(device)

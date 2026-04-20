@@ -1263,15 +1263,14 @@ class WanVideoAnimateEmbeds:
             if not looping:
                 pose_latents = vae.encode([resized_pose_images.to(device, vae.dtype)], device,tiled=tiled_vae)
                 pose_latents = pose_latents.to(offload_device)
-            
+
                 if pose_latents.shape[2] < latent_window_size:
                     log.info(f"WanAnimate: Padding pose latents from {pose_latents.shape} to length {latent_window_size}")
                     pad_len = latent_window_size - pose_latents.shape[2]
                     pad = torch.zeros(pose_latents.shape[0], pose_latents.shape[1], pad_len, pose_latents.shape[3], pose_latents.shape[4], device=pose_latents.device, dtype=pose_latents.dtype)
                     pose_latents = torch.cat([pose_latents, pad], dim=2)
-                del resized_pose_images
-            else:
-                resized_pose_images = resized_pose_images.to(offload_device, dtype=vae.dtype)            
+            # Always persist raw pixels on offload device — needed by the looping sampler path and by the swap auto-fix.
+            resized_pose_images = resized_pose_images.to(offload_device, dtype=vae.dtype)
 
         bg_latents = None
         if bg_images is not None:
@@ -1283,9 +1282,14 @@ class WanVideoAnimateEmbeds:
 
         if not looping:
             if bg_images is None:
-                resized_bg_images = torch.zeros(3, num_frames - num_refs, H, W, device=device, dtype=vae.dtype)
-            bg_latents = vae.encode([resized_bg_images.to(device, vae.dtype)], device,tiled=tiled_vae)[0].to(offload_device)
-            del resized_bg_images
+                # Non-looping with no bg input: synthesize a zero tensor just for the VAE encode; do not persist.
+                encode_bg = torch.zeros(3, num_frames - num_refs, H, W, device=device, dtype=vae.dtype)
+                bg_latents = vae.encode([encode_bg], device, tiled=tiled_vae)[0].to(offload_device)
+                del encode_bg
+            else:
+                bg_latents = vae.encode([resized_bg_images.to(device, vae.dtype)], device, tiled=tiled_vae)[0].to(offload_device)
+                # Persist raw bg pixels on offload for the looping sampler path and the swap auto-fix.
+                resized_bg_images = resized_bg_images.to(offload_device, dtype=vae.dtype)
         elif bg_images is not None:
             resized_bg_images = resized_bg_images.to(offload_device, dtype=vae.dtype)
 
@@ -1352,8 +1356,8 @@ class WanVideoAnimateEmbeds:
             "negative_clip_context": clip_embeds.get("negative_clip_embeds", None) if clip_embeds is not None else None,
             "max_seq_len": seq_len,
             "pose_latents": pose_latents,
-            "pose_images": resized_pose_images if pose_images is not None and looping else None,
-            "bg_images": resized_bg_images if bg_images is not None and looping else None,
+            "pose_images": resized_pose_images if pose_images is not None else None,
+            "bg_images": resized_bg_images if bg_images is not None else None,
             "ref_masks": bg_mask if mask is not None and looping else None,
             "is_masked": mask is not None,
             "ref_latent": ref_latent,
@@ -1390,8 +1394,47 @@ class WanVideoAnimateRefSwap:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
+    @staticmethod
+    def _convert_to_looping(embeds):
+        """Rewrite a non-looping Embeds dict into looping-mode shape so the swap can be honored."""
+        converted = dict(embeds)
+
+        # Masked workflows bake bg_mask into the non-looping bg_latents_masked; the looping sampler
+        # path doesn't know how to use that. Refuse rather than silently drop the mask.
+        if converted.get("is_masked", False):
+            raise RuntimeError(
+                "WanVideoAnimateRefSwap: cannot auto-convert a masked WanVideoAnimateEmbeds into looping mode. "
+                "Enable 'force_looping' on WanVideoAnimateEmbeds so the mask is built in looping shape."
+            )
+
+        # Extract ref_latent_masked (first time-slice) from the non-looping combined ref_latent.
+        # Non-looping shape: [20, 1 + T_bg, H, W]. Looping expects just [20, 1, H, W].
+        ref_latent = converted.get("ref_latent", None)
+        if ref_latent is not None and ref_latent.dim() == 4 and ref_latent.shape[1] > 1:
+            converted["ref_latent"] = ref_latent[:, :1].clone()
+
+        # Drop pre-encoded latents — the looping sampler re-encodes per window from raw pose/bg pixels.
+        converted["pose_latents"] = None
+        converted["bg_latents"] = None
+
+        # Reverse the non-looping "num_frames += num_refs * 4" extension.
+        ref_image = converted.get("ref_image", None)
+        num_refs = ref_image.shape[1] if (ref_image is not None and ref_image.dim() == 4) else 1
+        stored_num_frames = converted.get("num_frames", 0)
+        converted["num_frames"] = max(1, stored_num_frames - num_refs * 4)
+
+        converted["looping"] = True
+
+        log.info(
+            f"WanVideoAnimateRefSwap: auto-enabled looping mode "
+            f"(num_frames {stored_num_frames} -> {converted['num_frames']}, num_refs={num_refs})."
+        )
+        return converted
+
     def process(self, embeds, ref_image, swap_frame, reset_temporal, transition_frames):
         updated = dict(embeds)
+        if not updated.get("looping", False):
+            updated = self._convert_to_looping(updated)
         if "ref_swaps" not in updated:
             updated["ref_swaps"] = []
         else:
@@ -1403,8 +1446,6 @@ class WanVideoAnimateRefSwap:
             "transition_frames": transition_frames,
         })
         updated["ref_swaps"].sort(key=lambda x: x["swap_frame"])
-        if not updated.get("looping", False):
-            log.warning("WanVideoAnimateRefSwap: upstream WanVideoAnimateEmbeds is not in looping mode — the ref swap will be IGNORED at sample time. Enable 'force_looping' on WanVideoAnimateEmbeds, or ensure num_frames > frame_window_size.")
         return (updated,)
 
 # region UniLumos

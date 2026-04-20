@@ -50,7 +50,12 @@ Multiple swap nodes produce a list of entries in `image_embeds["ref_swaps"]`, so
 
 ### Requirements
 
-- Upstream `WanVideoAnimateEmbeds` **must** be in looping mode — either because `num_frames > frame_window_size`, or because you enabled `force_looping` on the embeds node. If not, the swap node logs a warning and the swap will be ignored at sample time.
+- **Looping mode is auto-enabled.** If upstream `WanVideoAnimateEmbeds` is in non-looping mode (short videos where `num_frames <= frame_window_size` and `force_looping` is off), the swap node rewrites the embeds dict into looping shape on the fly — you don't have to remember to check `force_looping`. The runtime log reports this as:
+  ```
+  WanVideoAnimateRefSwap: auto-enabled looping mode (num_frames X -> Y, num_refs=Z).
+  ```
+  `force_looping` on Embeds is optional. It's still useful if you want looping without a swap (e.g. a short-video workflow that just needs multiple windows for some other reason).
+- **Exception: masked workflows.** If `WanVideoAnimateEmbeds` has a `mask` input, auto-conversion refuses with a clear `RuntimeError` — the mask is baked into the non-looping `bg_latents_masked` in a way that can't be cleanly split out. Enable `force_looping=True` on Embeds to build the mask in looping shape from the start.
 - Incompatible features (see [fallback rules](#fallback-rules) below) cause the swap to fall back to coarse window-boundary snapping instead of frame-accurate placement.
 
 ---

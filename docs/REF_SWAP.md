@@ -226,5 +226,6 @@ The swap code path uses the sampler-local `vae_upscale_factor` (16 for Wan 5B, 8
 - `fad4a3e` — preserve user's `num_frames` in looping mode; `60` + `swap_frame=30` now produces two exact 30-frame windows instead of `30 + 27`.
 - `542c1b5` — auto-convert non-looping Embeds to looping when `WanVideoAnimateRefSwap` is connected, so the swap always takes effect without the user having to toggle `force_looping`.
 - `58b8a3a` — support masked Embeds in the variable-window path; `_convert_to_looping` extracts `bg_mask` from the non-looping combined `ref_latent`, sampler gating drops the `wananim_ref_masks is None` requirement, and per-iter `start_latent` / `end_latent` are computed for correct mask slicing.
+- `2eb7c5e` — replace `transition_frames` latent-blend micro-windows with pixel-space cross-fade (A/B sibling iterations, shared noise, per-frame smoothstep blend). Per-frame smooth; 2× compute in the transition region only.
 
 Keep this doc in sync whenever new behavior lands.

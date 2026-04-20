@@ -2229,19 +2229,24 @@ class WanVideoSampler:
 
                         window_schedule = []
                         if use_variable_windows:
-                            # Step 1: collect per-swap transition crossfade ranges. Each transition becomes ONE region (sampled twice:
-                            # pass A with prior ref, pass B with new ref, then blended in pixel space). Must fit in one sampling window.
-                            max_trans_width = max(1, frame_window_size - refert_num)
-                            transition_crossfades = []   # list of (trans_start, trans_end, new_swap_idx)
+                            def _apply_transition_curve(_w, _curve):
+                                if _curve == "smoothstep":
+                                    return 3 * _w * _w - 2 * _w * _w * _w
+                                if _curve == "ease_in":
+                                    return _w * _w
+                                if _curve == "ease_out":
+                                    return 1.0 - (1.0 - _w) * (1.0 - _w)
+                                return _w  # linear / unknown
+
+                            # Step 1: build per-swap transition micro-segments (one entry per micro-window inside the transition region).
+                            # Each transition_segments entry: (seg_start, seg_end, target_swap_idx, weight in (0,1)).
+                            transition_segments = []
                             _used_ranges = []
                             for _swap_i, _swap in enumerate(ref_swaps):
                                 _tf = int(_swap.get("transition_frames", 0) or 0)
                                 _sf = _swap["swap_frame"]
                                 if _tf <= 0 or _sf <= 0 or _sf >= total_frames:
                                     continue
-                                if _tf > max_trans_width:
-                                    log.warning(f"WanAnimate: clamping transition_frames {_tf} -> {max_trans_width} for swap {_swap_i} (crossfade region must fit in one sampling window).")
-                                    _tf = max_trans_width
                                 _trans_start = max(0, _sf - _tf)
                                 _trans_end = _sf
                                 _overlap = False
@@ -2253,25 +2258,38 @@ class WanVideoSampler:
                                 if _overlap:
                                     continue
                                 _used_ranges.append((_trans_start, _trans_end, _swap_i))
-                                transition_crossfades.append((_trans_start, _trans_end, _swap_i))
+                                # Step count: user override or auto (1 per 10 frames, no cap).
+                                _override = int(_swap.get("transition_steps", 0) or 0)
+                                _N = _override if _override > 0 else max(1, int(round(_tf / 10)))
+                                _N = max(1, min(_N, _tf))  # can't have more steps than frames
+                                _step = (_trans_end - _trans_start) / _N
+                                _curve = _swap.get("transition_curve", "linear")
+                                for _k in range(_N):
+                                    _seg_start = int(round(_trans_start + _k * _step))
+                                    _seg_end = int(round(_trans_start + (_k + 1) * _step))
+                                    if _seg_end <= _seg_start:
+                                        continue
+                                    _t_norm = (_k + 1) / (_N + 1)
+                                    _weight = _apply_transition_curve(_t_norm, _curve)
+                                    transition_segments.append((_seg_start, _seg_end, _swap_i, _weight))
 
-                            # Step 2: build master boundary list (hard swap frames + crossfade region edges).
+                            # Step 2: build master boundary list (hard swap frames + transition segment edges).
                             _forced = set()
                             for _s in ref_swaps:
                                 if 0 < _s["swap_frame"] < total_frames:
                                     _forced.add(_s["swap_frame"])
-                            for _ts, _te, _ in transition_crossfades:
+                            for _ts, _te, _, _ in transition_segments:
                                 if 0 < _ts < total_frames:
                                     _forced.add(_ts)
                                 if 0 < _te < total_frames:
                                     _forced.add(_te)
                             _boundaries = sorted([0] + list(_forced) + [total_frames])
 
-                            # Step 3: emit schedule entries. A segment that exactly equals a crossfade range becomes TWO entries (A then B).
-                            def _lookup_crossfade(_seg_start, _seg_end):
-                                for _ts, _te, _swap_i in transition_crossfades:
-                                    if _seg_start == _ts and _seg_end == _te:
-                                        return _swap_i
+                            # Step 3: for each segment, determine target_ref_idx and apply_weight, subdivide into windows of at most frame_window_size.
+                            def _lookup_weight(_mid_frame):
+                                for _ts, _te, _swap_i, _w in transition_segments:
+                                    if _ts <= _mid_frame < _te:
+                                        return (_swap_i, _w)
                                 return None
 
                             for _bi in range(len(_boundaries) - 1):
@@ -2279,35 +2297,29 @@ class WanVideoSampler:
                                 _seg_end = _boundaries[_bi + 1]
                                 if _seg_start >= _seg_end:
                                     continue
-                                _cf_swap_idx = _lookup_crossfade(_seg_start, _seg_end)
-                                if _cf_swap_idx is not None:
-                                    # Determine prior ref idx (fully applied at start of crossfade).
-                                    _prior_ref = -1
-                                    for _swap_i2, _swap2 in enumerate(ref_swaps):
-                                        if _swap2["swap_frame"] <= _seg_start:
-                                            _prior_ref = _swap_i2
-                                    window_schedule.append((_seg_start, _seg_end, _prior_ref, 1.0, 'A'))
-                                    window_schedule.append((_seg_start, _seg_end, _cf_swap_idx, 1.0, 'B'))
+                                _mid = (_seg_start + _seg_end) / 2
+                                _trans_info = _lookup_weight(_mid)
+                                if _trans_info is not None:
+                                    _target_ref, _apply_weight = _trans_info
                                 else:
-                                    # Normal segment — find active swap, subdivide into windows of at most frame_window_size.
                                     _active = -1
                                     for _swap_i2, _swap2 in enumerate(ref_swaps):
                                         if _swap2["swap_frame"] <= _seg_start:
                                             _active = _swap_i2
+                                    _target_ref = _active
                                     _apply_weight = 1.0 if _active >= 0 else 0.0
-                                    _cur = _seg_start
-                                    while _cur < _seg_end:
-                                        _is_first_ever = (len(window_schedule) == 0)
-                                        _max_out = frame_window_size if _is_first_ever else (frame_window_size - refert_num)
-                                        _out_size = min(_max_out, _seg_end - _cur)
-                                        window_schedule.append((_cur, _cur + _out_size, _active, _apply_weight, None))
-                                        _cur += _out_size
+                                _cur = _seg_start
+                                while _cur < _seg_end:
+                                    _is_first_ever = (len(window_schedule) == 0)
+                                    _max_out = frame_window_size if _is_first_ever else (frame_window_size - refert_num)
+                                    _out_size = min(_max_out, _seg_end - _cur)
+                                    window_schedule.append((_cur, _cur + _out_size, _target_ref, _apply_weight))
+                                    _cur += _out_size
 
                             # Compute the widest end-of-window (pixel) and end-latent (for mask pingpong) we will slice into.
                             _max_sched_end = 0
                             _max_end_latent = 0
-                            for _i, _entry in enumerate(window_schedule):
-                                _os, _oe = _entry[0], _entry[1]
+                            for _i, (_os, _oe, _, _) in enumerate(window_schedule):
                                 _is_first = (_os == 0)
                                 _win_in_start = _os if _is_first else _os - refert_num
                                 _start_latent_i = 0 if _win_in_start == 0 else (_win_in_start - 1) // 4 + 1
@@ -2323,7 +2335,7 @@ class WanVideoSampler:
                             if _max_end_latent > target_latent_len:
                                 target_latent_len = _max_end_latent
                             estimated_iterations = len(window_schedule)
-                            _sched_pretty = [(e[0], e[1], e[2], round(e[3], 3), e[4]) for e in window_schedule]
+                            _sched_pretty = [(s, e, r, round(w, 3)) for s, e, r, w in window_schedule]
                             log.info(f"WanAnimate: variable-window schedule with {estimated_iterations} windows from {len(ref_swaps)} swap(s): {_sched_pretty}")
 
                         if wananim_face_pixels is not None:
@@ -2357,11 +2369,6 @@ class WanVideoSampler:
                         cur_latent_window_size = latent_window_size
                         iter_out_size = None
                         iter_is_first = True
-                        iter_crossfade_role = None
-
-                        # Cross-fade buffers: A pass saves its output and noise here; B pass consumes them.
-                        crossfade_pending_videos = None
-                        crossfade_pending_noise = None
 
                         callback = prepare_callback(patcher, estimated_iterations)
                         log.info(f"Sampling {total_frames} frames in {estimated_iterations} windows, at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps} steps")
@@ -2372,12 +2379,7 @@ class WanVideoSampler:
                             if use_variable_windows:
                                 if iteration_count >= len(window_schedule):
                                     break
-                                _entry = window_schedule[iteration_count]
-                                if len(_entry) == 5:
-                                    iter_out_start, iter_out_end, iter_target_ref, iter_apply_weight, iter_crossfade_role = _entry
-                                else:
-                                    iter_out_start, iter_out_end, iter_target_ref, iter_apply_weight = _entry
-                                    iter_crossfade_role = None
+                                iter_out_start, iter_out_end, iter_target_ref, iter_apply_weight = window_schedule[iteration_count]
                                 iter_out_size = iter_out_end - iter_out_start
                                 iter_is_first = (iter_out_start == 0)
                                 if iter_is_first:
@@ -2437,11 +2439,9 @@ class WanVideoSampler:
                                     ref_latent = new_ref_latent_cache[iter_target_ref]
                                     ref_images = new_ref_img_cache[iter_target_ref]
                                     current_swap = ref_swaps[iter_target_ref]
-                                    # Defer reset_temporal for pass B of a crossfade — applied after the blend in the post-decode step.
-                                    if current_swap.get("reset_temporal", False) and iter_crossfade_role != 'B':
+                                    if current_swap.get("reset_temporal", False):
                                         current_ref_images = new_ref_img_cache[iter_target_ref].clone().to(offload_device)
-                                    _role_note = '(pass B of crossfade)' if iter_crossfade_role == 'B' else 'fully'
-                                    log.info(f"WanAnimate: Applying ref swap idx {iter_target_ref} {_role_note} (window starts at output frame {iter_out_start}, requested swap_frame {current_swap['swap_frame']})")
+                                    log.info(f"WanAnimate: Applying ref swap idx {iter_target_ref} fully (window starts at output frame {iter_out_start}, requested swap_frame {current_swap['swap_frame']})")
                                     _iter_ref_latent = ref_latent
                             elif ref_swaps:
                                 new_swap_idx = active_swap_idx
@@ -2479,13 +2479,7 @@ class WanVideoSampler:
 
                             self.cache_state = [None, None]
 
-                            if iter_crossfade_role == 'B' and crossfade_pending_noise is not None:
-                                # Reuse the noise from pass A so A and B differ only in the ref conditioning.
-                                noise = crossfade_pending_noise.clone().to(device)
-                            else:
-                                noise = torch.randn(16, cur_latent_window_size + 1, lat_h, lat_w, dtype=torch.float32, device=torch.device("cpu"), generator=seed_g).to(device)
-                                if iter_crossfade_role == 'A':
-                                    crossfade_pending_noise = noise.clone()
+                            noise = torch.randn(16, cur_latent_window_size + 1, lat_h, lat_w, dtype=torch.float32, device=torch.device("cpu"), generator=seed_g).to(device)
                             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
 
                             if current_ref_images is not None or bg_images is not None or ref_latent is not None:
@@ -2683,38 +2677,9 @@ class WanVideoSampler:
                                 videos = torch.stack(cm_result_list, dim=0).permute(3, 0, 1, 2)
                                 del cm_result_list
 
-                            # --- Cross-fade handling ---
-                            if iter_crossfade_role == 'A':
-                                # Buffer pass-A output and skip state updates / append. Pass B will blend with this.
-                                crossfade_pending_videos = videos.clone()
-                                del videos
-                            elif iter_crossfade_role == 'B':
-                                # Blend buffered pass A with this pass using a per-frame smoothstep curve.
-                                videos_A = crossfade_pending_videos
-                                videos_B = videos
-                                if videos_A.shape != videos_B.shape:
-                                    log.warning(f"WanAnimate: crossfade shape mismatch {videos_A.shape} vs {videos_B.shape}; falling back to pass B alone.")
-                                    videos = videos_B
-                                else:
-                                    _T = videos_B.shape[1]
-                                    _t = torch.arange(_T, device=videos_B.device, dtype=videos_B.dtype) / max(_T - 1, 1)
-                                    _w = 3 * _t**2 - 2 * _t**3  # smoothstep
-                                    _w = _w.view(1, _T, 1, 1)
-                                    videos = (1 - _w) * videos_A + _w * videos_B
-                                # Deferred reset_temporal / current_ref_images update, using the blended output.
-                                _cf_swap = ref_swaps[iter_target_ref] if iter_target_ref >= 0 else {}
-                                if _cf_swap.get("reset_temporal", False):
-                                    current_ref_images = new_ref_img_cache[iter_target_ref].clone().to(offload_device)
-                                else:
-                                    current_ref_images = videos[:, -refert_num:].clone().detach()
-                                gen_video_list.append(videos)
-                                crossfade_pending_videos = None
-                                crossfade_pending_noise = None
-                                del videos_A, videos_B, videos
-                            else:
-                                current_ref_images = videos[:, -refert_num:].clone().detach()
-                                gen_video_list.append(videos)
-                                del videos
+                            current_ref_images = videos[:, -refert_num:].clone().detach()
+                            gen_video_list.append(videos)
+                            del videos
 
                             iteration_count += 1
                             if not use_variable_windows:

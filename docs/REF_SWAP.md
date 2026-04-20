@@ -218,5 +218,6 @@ The swap code path uses the sampler-local `vae_upscale_factor` (16 for Wan 5B, 8
 - `96badcb` — fixed the hardcoded 5B upscale factor, added `reset_temporal`, tooltip + logging improvements.
 - `942ed32` — variable-window schedule path, `force_looping` on `WanVideoAnimateEmbeds`, frame-accurate swap placement.
 - `3a92dd7` — `transition_frames` for smooth ref-image transitions via latent interpolation over micro-windows.
+- `fad4a3e` — preserve user's `num_frames` in looping mode; `60` + `swap_frame=30` now produces two exact 30-frame windows instead of `30 + 27`.
 
 Keep this doc in sync whenever new behavior lands.

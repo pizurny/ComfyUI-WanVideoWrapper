@@ -2220,13 +2220,12 @@ class WanVideoSampler:
                         new_ref_img_cache = {}
                         use_variable_windows = (
                             bool(ref_swaps)
-                            and wananim_ref_masks is None
                             and samples is None
                             and uni3c_embeds is None
                             and current_ref_images is None  # start_ref_image path uses special first-iter handling
                         )
                         if ref_swaps and not use_variable_windows:
-                            log.warning("WanAnimate: ref_swaps present but falling back to fixed-window stride because ref_masks / input samples / uni3c / start_ref_image are in use.")
+                            log.warning("WanAnimate: ref_swaps present but falling back to fixed-window stride because input samples / uni3c / start_ref_image are in use.")
 
                         window_schedule = []
                         if use_variable_windows:
@@ -2308,18 +2307,24 @@ class WanVideoSampler:
                                     window_schedule.append((_cur, _cur + _out_size, _target_ref, _apply_weight))
                                     _cur += _out_size
 
-                            # Compute the widest end-of-window we will slice into, accounting for VAE-aligned rounding up.
+                            # Compute the widest end-of-window (pixel) and end-latent (for mask pingpong) we will slice into.
                             _max_sched_end = 0
+                            _max_end_latent = 0
                             for _i, (_os, _oe, _, _) in enumerate(window_schedule):
                                 _is_first = (_i == 0)
                                 _win_in_start = _os if _is_first else _os - refert_num
+                                _start_latent_i = 0 if _win_in_start == 0 else (_win_in_start - 1) // 4 + 1
                                 _win_sampled = (_oe - _os) if _is_first else (_oe - _os + refert_num)
                                 _win_fws = _win_sampled if (_win_sampled - 1) % 4 == 0 else _win_sampled + (4 - ((_win_sampled - 1) % 4))
+                                _cur_lws_i = (_win_fws - 1) // 4 + 1
                                 _max_sched_end = max(_max_sched_end, _win_in_start + _win_fws)
+                                _max_end_latent = max(_max_end_latent, _start_latent_i + _cur_lws_i)
                             if _max_sched_end > target_len:
                                 log.info(f"WanAnimate: expanding target_len from {target_len} to {_max_sched_end} to cover variable-window schedule")
                                 target_len = _max_sched_end
                                 target_latent_len = (target_len - 1) // 4 + len(window_schedule)
+                            if _max_end_latent > target_latent_len:
+                                target_latent_len = _max_end_latent
                             estimated_iterations = len(window_schedule)
                             _sched_pretty = [(s, e, r, round(w, 3)) for s, e, r, w in window_schedule]
                             log.info(f"WanAnimate: variable-window schedule with {estimated_iterations} windows from {len(ref_swaps)} swap(s): {_sched_pretty}")
@@ -2377,6 +2382,9 @@ class WanVideoSampler:
                                 cur_frame_window_size = _sampled if (_sampled - 1) % 4 == 0 else _sampled + (4 - ((_sampled - 1) % 4))
                                 cur_latent_window_size = (cur_frame_window_size - 1) // 4 + 1
                                 end = start + cur_frame_window_size
+                                # Latent indices for this window (used by ref_masks slicing). VAE: latent 0 = frame 0, latent N>=1 = frames (N-1)*4+1..N*4.
+                                start_latent = 0 if start == 0 else (start - 1) // 4 + 1
+                                end_latent = start_latent + cur_latent_window_size
                             else:
                                 if start + refert_num >= total_frames:
                                     break

@@ -1399,23 +1399,23 @@ class WanVideoAnimateRefSwap:
         """Rewrite a non-looping Embeds dict into looping-mode shape so the swap can be honored."""
         converted = dict(embeds)
 
-        # Masked workflows bake bg_mask into the non-looping bg_latents_masked; the looping sampler
-        # path doesn't know how to use that. Refuse rather than silently drop the mask.
-        if converted.get("is_masked", False):
-            raise RuntimeError(
-                "WanVideoAnimateRefSwap: cannot auto-convert a masked WanVideoAnimateEmbeds into looping mode. "
-                "Enable 'force_looping' on WanVideoAnimateEmbeds so the mask is built in looping shape."
-            )
-
         # Extract ref_latent_masked (first time-slice) from the non-looping combined ref_latent.
-        # Non-looping shape: [20, 1 + T_bg, H, W]. Looping expects just [20, 1, H, W].
+        # Non-looping shape: [20, 1 + T_bg, H, W] = cat([ref_latent_masked, bg_latents_masked], dim=1).
+        # Channels 0-3 of the bg_latents_masked slice are the looping-mode bg_mask (ref_masks).
         ref_latent = converted.get("ref_latent", None)
+        extracted_bg_mask = None
         if ref_latent is not None and ref_latent.dim() == 4 and ref_latent.shape[1] > 1:
-            converted["ref_latent"] = ref_latent[:, :1].clone()
+            if converted.get("is_masked", False):
+                extracted_bg_mask = ref_latent[:4, 1:].clone()  # [4, T_bg, lat_h, lat_w]
+            converted["ref_latent"] = ref_latent[:, :1].clone()  # ref_latent_masked
 
         # Drop pre-encoded latents — the looping sampler re-encodes per window from raw pose/bg pixels.
         converted["pose_latents"] = None
         converted["bg_latents"] = None
+
+        # Preserve the user's mask in looping shape. Without this, the sampler's looping path has no mask.
+        if extracted_bg_mask is not None:
+            converted["ref_masks"] = extracted_bg_mask
 
         # Reverse the non-looping "num_frames += num_refs * 4" extension.
         ref_image = converted.get("ref_image", None)
@@ -1427,7 +1427,8 @@ class WanVideoAnimateRefSwap:
 
         log.info(
             f"WanVideoAnimateRefSwap: auto-enabled looping mode "
-            f"(num_frames {stored_num_frames} -> {converted['num_frames']}, num_refs={num_refs})."
+            f"(num_frames {stored_num_frames} -> {converted['num_frames']}, num_refs={num_refs}, "
+            f"mask={'extracted' if extracted_bg_mask is not None else 'none'})."
         )
         return converted
 

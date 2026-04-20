@@ -52,10 +52,10 @@ Multiple swap nodes produce a list of entries in `image_embeds["ref_swaps"]`, so
 
 - **Looping mode is auto-enabled.** If upstream `WanVideoAnimateEmbeds` is in non-looping mode (short videos where `num_frames <= frame_window_size` and `force_looping` is off), the swap node rewrites the embeds dict into looping shape on the fly — you don't have to remember to check `force_looping`. The runtime log reports this as:
   ```
-  WanVideoAnimateRefSwap: auto-enabled looping mode (num_frames X -> Y, num_refs=Z).
+  WanVideoAnimateRefSwap: auto-enabled looping mode (num_frames X -> Y, num_refs=Z, mask=extracted|none).
   ```
   `force_looping` on Embeds is optional. It's still useful if you want looping without a swap (e.g. a short-video workflow that just needs multiple windows for some other reason).
-- **Exception: masked workflows.** If `WanVideoAnimateEmbeds` has a `mask` input, auto-conversion refuses with a clear `RuntimeError` — the mask is baked into the non-looping `bg_latents_masked` in a way that can't be cleanly split out. Enable `force_looping=True` on Embeds to build the mask in looping shape from the start.
+- **Masked workflows are supported.** When Embeds has a `mask` input, the auto-conversion extracts the latent-space `bg_mask` from the non-looping combined `ref_latent` (channels 0-3 of `ref_latent[:, 1:]`) and re-exposes it as `ref_masks` in looping shape. Variable-window mode honors it via per-iteration `start_latent:end_latent` slicing of the pingpong-padded mask.
 - Incompatible features (see [fallback rules](#fallback-rules) below) cause the swap to fall back to coarse window-boundary snapping instead of frame-accurate placement.
 
 ---
@@ -187,15 +187,16 @@ WanAnimate: Applying ref swap idx 0 fully (window starts at output frame 100, re
 The variable-window path activates only when **all** of these are true:
 
 - At least one `WanVideoAnimateRefSwap` node is connected.
-- `wananim_ref_masks` is not in use.
 - `samples` (input latents for vid2vid / denoise) is not in use.
 - `uni3c_embeds` is not in use.
 - `start_ref_image` on `WanVideoAnimateEmbeds` is not set.
 
-If any of those is violated, the sampler logs:
+Spatial `mask` input on Embeds is OK — variable-window mode handles it now via per-iter `start_latent:end_latent` slicing.
+
+If any of the remaining fallbacks are violated, the sampler logs:
 
 ```
-WanAnimate: ref_swaps present but falling back to fixed-window stride because ref_masks / input samples / uni3c / start_ref_image are in use.
+WanAnimate: ref_swaps present but falling back to fixed-window stride because input samples / uni3c / start_ref_image are in use.
 ```
 
 In fallback mode, swaps still work but snap to the fixed 77-frame window boundaries (so `swap_frame=30` in a 150-frame render still fires at frame 77, not 30). Supporting variable windows alongside masks / uni3c / input samples would require re-deriving per-latent index math for variable window sizes — out of scope for now.

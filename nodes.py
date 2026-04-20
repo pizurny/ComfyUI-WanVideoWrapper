@@ -1228,12 +1228,17 @@ class WanVideoAnimateEmbeds:
         lat_w = W // vae.upsampling_factor
 
         num_refs = ref_images.shape[0] if ref_images is not None else 0
-        num_frames = ((num_frames - 1) // 4) * 4 + 1
 
+        # Decide looping mode from the raw user input before any quantization.
         looping = num_frames > frame_window_size or start_ref_image is not None or force_looping
 
-        if num_frames < frame_window_size:
-            frame_window_size = num_frames
+        if not looping:
+            # Non-looping mode encodes the whole video in a single VAE pass, so it needs a 4k+1 length.
+            num_frames = ((num_frames - 1) // 4) * 4 + 1
+            if num_frames < frame_window_size:
+                frame_window_size = num_frames
+        # else: looping mode — keep num_frames and frame_window_size as-is.
+        # The sampler's variable-window path handles arbitrary sizes via per-window VAE-aligned sampling + truncation.
 
         target_shape = (16, (num_frames - 1) // 4 + 1 + num_refs, lat_h, lat_w)
         latent_window_size = ((frame_window_size - 1) // 4)

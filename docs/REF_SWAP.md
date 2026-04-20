@@ -92,25 +92,27 @@ Total output: `77 + 23 + 17 = 117` frames. Swap takes effect at output frame 100
 
 **Example B — `num_frames=60`, `swap_frame=30`, `frame_window_size=77`, `force_looping=True`:**
 
-Quantized `num_frames` → 57. `frame_window_size` is clamped to 57 by Embeds.
+In looping mode `num_frames` is preserved exactly as the user set it — no quantization, no clamp on `frame_window_size`.
 
 | iter | segment | window | `cur_frame_window_size` | sampled | decoded | drop | output |
 |------|---------|--------|-------------------------|---------|---------|------|--------|
 | 0 | `[0,30)` ref A | `(0, 30)` | 33 | 30 | 33 | 0 | 30 |
-| 1 | `[30,57)` ref B | `(30, 57)` | 29 | 28 | 29 | 1 | 27 |
+| 1 | `[30,60)` ref B | `(30, 60)` | 33 | 31 | 33 | 1 | 30 |
 
-Total output: `30 + 27 = 57` frames.
+Total output: `30 + 30 = 60` frames — exactly two 30-frame windows, which is what the user asked for.
 
 The sampler logs the full schedule at startup so you can confirm the split before waiting for sampling:
 
 ```
-WanAnimate: variable-window schedule with 2 windows from 1 swap(s): [(0, 30), (30, 57)]
-WanAnimate: Applying ref swap idx 0 (requested frame 30, window starts at output frame 30)
+WanAnimate: variable-window schedule with 2 windows from 1 swap(s): [(0, 30, -1, 0.0), (30, 60, 0, 1.0)]
+WanAnimate: Applying ref swap idx 0 fully (window starts at output frame 30, requested swap_frame 30)
 ```
 
 ### Latent quantization
 
 The Wan VAE compresses temporally by 4×, so valid window frame counts are `{1, 5, 9, ..., 4k+1}`. A requested window of 30 frames is sampled as 33 and truncated; a requested window of 20 frames is sampled as 21 (plus 1 temporal overlap for non-initial windows). Extra frames are wasted compute; output is always exactly the requested size.
+
+**Total `num_frames` is preserved in looping mode.** `WanVideoAnimateEmbeds` no longer rounds `num_frames` down to the nearest `4k+1` when looping is active — per-window output truncation handles alignment so the schedule ends exactly at the user's requested total. Non-looping mode (single-window VAE encode) still quantizes, since its encode pass requires a `4k+1` total length.
 
 ### `reset_temporal` in practice
 

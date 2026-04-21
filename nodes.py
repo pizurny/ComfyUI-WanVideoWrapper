@@ -1386,9 +1386,7 @@ class WanVideoAnimateRefSwap:
             "ref_image": ("IMAGE", {"tooltip": "New reference image to swap to at the specified frame"}),
             "swap_frame": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Output frame at which to start using this reference image. The sampler forces a new window boundary at this frame so the swap is frame-accurate (modulo VAE 4-frame latent quantization). Requires looping mode on WanVideoAnimateEmbeds (num_frames > frame_window_size OR force_looping=True)."}),
             "reset_temporal": ("BOOLEAN", {"default": False, "tooltip": "If True, breaks temporal continuity at the swap by reseeding the temporal reference with the new ref image itself, giving a hard identity cut instead of a morph from the prior window's last frame. Applies only at the full-swap boundary, not during a blended transition."}),
-            "transition_frames": ("INT", {"default": 0, "min": 0, "max": 500, "step": 1, "tooltip": "If > 0, the sampler inserts N intermediate micro-windows before swap_frame (over this many output frames), each using a linearly-blended ref latent mixing the prior and new ref. Creates a smooth identity transition. Zero = hard swap at swap_frame (default). Ignored when the sampler falls back to fixed windows (uni3c / start_ref_image / input samples in use)."}),
-            "transition_steps": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1, "tooltip": "Number of micro-windows to use for the identity transition. 0 = auto-compute from transition_frames (~1 step per 10 frames, no cap). Higher N = finer identity gradient but shorter micro-windows (each has less temporal context for the model)."}),
-            "transition_curve": (["linear", "smoothstep", "ease_in", "ease_out"], {"default": "linear", "tooltip": "Weight distribution across the micro-windows. linear = evenly spaced (k+1)/(N+1). smoothstep = concentrates transition in middle. ease_in = slow start / fast end (holds on old identity longer). ease_out = fast start / slow end (reaches new identity faster, holds near it)."}),
+            "transition_frames": ("INT", {"default": 0, "min": 0, "max": 500, "step": 1, "tooltip": "If > 0, two overlapping sampling windows (one with the prior ref, one with the new ref) are run and their latents are blended over this many output frames centered on swap_frame. Produces a smooth identity transition. Zero = hard swap at swap_frame (default). V1: only the first transition in the chain is honored; transitions are ignored when the sampler falls back to fixed windows (uni3c / start_ref_image / input samples in use)."}),
         }}
 
     RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
@@ -1434,7 +1432,7 @@ class WanVideoAnimateRefSwap:
         )
         return converted
 
-    def process(self, embeds, ref_image, swap_frame, reset_temporal, transition_frames, transition_steps, transition_curve):
+    def process(self, embeds, ref_image, swap_frame, reset_temporal, transition_frames):
         updated = dict(embeds)
         if not updated.get("looping", False):
             updated = self._convert_to_looping(updated)
@@ -1447,8 +1445,6 @@ class WanVideoAnimateRefSwap:
             "swap_frame": swap_frame,
             "reset_temporal": reset_temporal,
             "transition_frames": transition_frames,
-            "transition_steps": transition_steps,
-            "transition_curve": transition_curve,
         })
         updated["ref_swaps"].sort(key=lambda x: x["swap_frame"])
         return (updated,)

@@ -2229,97 +2229,87 @@ class WanVideoSampler:
 
                         window_schedule = []
                         if use_variable_windows:
-                            def _apply_transition_curve(_w, _curve):
-                                if _curve == "smoothstep":
-                                    return 3 * _w * _w - 2 * _w * _w * _w
-                                if _curve == "ease_in":
-                                    return _w * _w
-                                if _curve == "ease_out":
-                                    return 1.0 - (1.0 - _w) * (1.0 - _w)
-                                return _w  # linear / unknown
-
-                            # Step 1: build per-swap transition micro-segments (one entry per micro-window inside the transition region).
-                            # Each transition_segments entry: (seg_start, seg_end, target_swap_idx, weight in (0,1)).
-                            transition_segments = []
-                            _used_ranges = []
+                            # V1: find the first swap with transition_frames > 0. Emit A/B overlap pair for that one. Others become hard swaps.
+                            _transition_swap_idx = -1
+                            _transition_swap = None
                             for _swap_i, _swap in enumerate(ref_swaps):
                                 _tf = int(_swap.get("transition_frames", 0) or 0)
                                 _sf = _swap["swap_frame"]
                                 if _tf <= 0 or _sf <= 0 or _sf >= total_frames:
                                     continue
-                                _trans_start = max(0, _sf - _tf)
-                                _trans_end = _sf
-                                _overlap = False
-                                for _r_start, _r_end, _r_swap_i in _used_ranges:
-                                    if _trans_start < _r_end and _trans_end > _r_start:
-                                        log.warning(f"WanAnimate: transition for swap {_swap_i} (frames {_trans_start}-{_trans_end}) overlaps swap {_r_swap_i}'s transition — dropping this transition, hard swap will be used.")
-                                        _overlap = True
-                                        break
-                                if _overlap:
+                                if _transition_swap_idx >= 0:
+                                    log.warning(f"WanAnimate: V1 supports only one transition — dropping transition_frames for swap {_swap_i}, using hard swap.")
                                     continue
-                                _used_ranges.append((_trans_start, _trans_end, _swap_i))
-                                # Step count: user override or auto (1 per 10 frames, no cap).
-                                _override = int(_swap.get("transition_steps", 0) or 0)
-                                _N = _override if _override > 0 else max(1, int(round(_tf / 10)))
-                                _N = max(1, min(_N, _tf))  # can't have more steps than frames
-                                _step = (_trans_end - _trans_start) / _N
-                                _curve = _swap.get("transition_curve", "linear")
-                                for _k in range(_N):
-                                    _seg_start = int(round(_trans_start + _k * _step))
-                                    _seg_end = int(round(_trans_start + (_k + 1) * _step))
-                                    if _seg_end <= _seg_start:
-                                        continue
-                                    _t_norm = (_k + 1) / (_N + 1)
-                                    _weight = _apply_transition_curve(_t_norm, _curve)
-                                    transition_segments.append((_seg_start, _seg_end, _swap_i, _weight))
+                                _transition_swap_idx = _swap_i
+                                _transition_swap = _swap
 
-                            # Step 2: build master boundary list (hard swap frames + transition segment edges).
+                            overlap_start = overlap_end = None
+                            if _transition_swap is not None:
+                                _tf = int(_transition_swap["transition_frames"])
+                                _sf = _transition_swap["swap_frame"]
+                                overlap_half = _tf // 2
+                                # Clamp so window A [0, overlap_end) and window B [overlap_start, total_frames) each fit in frame_window_size.
+                                _max_half_A = max(0, frame_window_size - _sf)
+                                _max_half_B = max(0, frame_window_size - (total_frames - _sf))
+                                _max_half = min(_max_half_A, _max_half_B)
+                                if overlap_half > _max_half:
+                                    log.warning(f"WanAnimate: clamping transition_frames {_tf} -> {2 * _max_half} so both overlap windows fit in frame_window_size={frame_window_size}.")
+                                    overlap_half = _max_half
+                                if overlap_half <= 0:
+                                    log.warning(f"WanAnimate: transition_frames cannot fit; dropping transition, using hard swap at frame {_sf}.")
+                                    _transition_swap = None
+                                else:
+                                    overlap_start = max(0, _sf - overlap_half)
+                                    overlap_end = min(total_frames, _sf + overlap_half)
+
                             _forced = set()
                             for _s in ref_swaps:
                                 if 0 < _s["swap_frame"] < total_frames:
                                     _forced.add(_s["swap_frame"])
-                            for _ts, _te, _, _ in transition_segments:
-                                if 0 < _ts < total_frames:
-                                    _forced.add(_ts)
-                                if 0 < _te < total_frames:
-                                    _forced.add(_te)
+                            if _transition_swap is not None:
+                                # Replace the hard swap boundary with the overlap edges.
+                                _forced.discard(_transition_swap["swap_frame"])
+                                _forced.add(overlap_start)
+                                _forced.add(overlap_end)
                             _boundaries = sorted([0] + list(_forced) + [total_frames])
 
-                            # Step 3: for each segment, determine target_ref_idx and apply_weight, subdivide into windows of at most frame_window_size.
-                            def _lookup_weight(_mid_frame):
-                                for _ts, _te, _swap_i, _w in transition_segments:
-                                    if _ts <= _mid_frame < _te:
-                                        return (_swap_i, _w)
-                                return None
-
+                            # Emit schedule entries. For the overlap region [overlap_start, overlap_end), emit two sibling windows (A, B).
+                            # Each schedule entry is a 7-tuple: (out_start, out_end, target_ref_idx, apply_weight, overlap_role, overlap_start, overlap_end).
                             for _bi in range(len(_boundaries) - 1):
                                 _seg_start = _boundaries[_bi]
                                 _seg_end = _boundaries[_bi + 1]
                                 if _seg_start >= _seg_end:
                                     continue
-                                _mid = (_seg_start + _seg_end) / 2
-                                _trans_info = _lookup_weight(_mid)
-                                if _trans_info is not None:
-                                    _target_ref, _apply_weight = _trans_info
+                                if _transition_swap is not None and _seg_start == overlap_start and _seg_end == overlap_end:
+                                    # Emit A (covers [0, overlap_end) with prior ref) and B (covers [overlap_start, total_frames) with new ref).
+                                    _prior_ref = -1
+                                    for _swap_i2, _swap2 in enumerate(ref_swaps):
+                                        if _swap2["swap_frame"] <= overlap_start and _swap_i2 != _transition_swap_idx:
+                                            _prior_ref = _swap_i2
+                                    window_schedule.append((0, overlap_end, _prior_ref, 1.0, 'A', overlap_start, overlap_end))
+                                    window_schedule.append((overlap_start, total_frames, _transition_swap_idx, 1.0, 'B', overlap_start, overlap_end))
+                                elif _transition_swap is not None and (_seg_end <= overlap_end and _seg_start >= 0 and _seg_end >= overlap_start):
+                                    # Skip segments that are absorbed into A or B windows (they span into the overlap). These are emitted as part of A/B above.
+                                    continue
                                 else:
                                     _active = -1
                                     for _swap_i2, _swap2 in enumerate(ref_swaps):
                                         if _swap2["swap_frame"] <= _seg_start:
                                             _active = _swap_i2
-                                    _target_ref = _active
                                     _apply_weight = 1.0 if _active >= 0 else 0.0
-                                _cur = _seg_start
-                                while _cur < _seg_end:
-                                    _is_first_ever = (len(window_schedule) == 0)
-                                    _max_out = frame_window_size if _is_first_ever else (frame_window_size - refert_num)
-                                    _out_size = min(_max_out, _seg_end - _cur)
-                                    window_schedule.append((_cur, _cur + _out_size, _target_ref, _apply_weight))
-                                    _cur += _out_size
+                                    _cur = _seg_start
+                                    while _cur < _seg_end:
+                                        _is_first_ever = (len(window_schedule) == 0)
+                                        _max_out = frame_window_size if _is_first_ever else (frame_window_size - refert_num)
+                                        _out_size = min(_max_out, _seg_end - _cur)
+                                        window_schedule.append((_cur, _cur + _out_size, _active, _apply_weight, None, None, None))
+                                        _cur += _out_size
 
                             # Compute the widest end-of-window (pixel) and end-latent (for mask pingpong) we will slice into.
                             _max_sched_end = 0
                             _max_end_latent = 0
-                            for _i, (_os, _oe, _, _) in enumerate(window_schedule):
+                            for _i, _entry in enumerate(window_schedule):
+                                _os, _oe = _entry[0], _entry[1]
                                 _is_first = (_os == 0)
                                 _win_in_start = _os if _is_first else _os - refert_num
                                 _start_latent_i = 0 if _win_in_start == 0 else (_win_in_start - 1) // 4 + 1
@@ -2335,7 +2325,7 @@ class WanVideoSampler:
                             if _max_end_latent > target_latent_len:
                                 target_latent_len = _max_end_latent
                             estimated_iterations = len(window_schedule)
-                            _sched_pretty = [(s, e, r, round(w, 3)) for s, e, r, w in window_schedule]
+                            _sched_pretty = [(e[0], e[1], e[2], round(e[3], 3), e[4]) for e in window_schedule]
                             log.info(f"WanAnimate: variable-window schedule with {estimated_iterations} windows from {len(ref_swaps)} swap(s): {_sched_pretty}")
 
                         if wananim_face_pixels is not None:
@@ -2369,6 +2359,12 @@ class WanVideoSampler:
                         cur_latent_window_size = latent_window_size
                         iter_out_size = None
                         iter_is_first = True
+                        iter_overlap_role = None
+                        iter_overlap_start = None
+                        iter_overlap_end = None
+
+                        # Overlap crossfade state — iter A saves its raw latent here for iter B to blend.
+                        overlap_pending_latent_A = None
 
                         callback = prepare_callback(patcher, estimated_iterations)
                         log.info(f"Sampling {total_frames} frames in {estimated_iterations} windows, at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps} steps")
@@ -2379,7 +2375,14 @@ class WanVideoSampler:
                             if use_variable_windows:
                                 if iteration_count >= len(window_schedule):
                                     break
-                                iter_out_start, iter_out_end, iter_target_ref, iter_apply_weight = window_schedule[iteration_count]
+                                _entry = window_schedule[iteration_count]
+                                if len(_entry) >= 7:
+                                    iter_out_start, iter_out_end, iter_target_ref, iter_apply_weight, iter_overlap_role, iter_overlap_start, iter_overlap_end = _entry[:7]
+                                else:
+                                    iter_out_start, iter_out_end, iter_target_ref, iter_apply_weight = _entry[:4]
+                                    iter_overlap_role = None
+                                    iter_overlap_start = None
+                                    iter_overlap_end = None
                                 iter_out_size = iter_out_end - iter_out_start
                                 iter_is_first = (iter_out_start == 0)
                                 if iter_is_first:
@@ -2472,7 +2475,10 @@ class WanVideoSampler:
                             if not use_variable_windows:
                                 _iter_ref_latent = ref_latent
 
-                            if current_ref_images is not None:
+                            if iter_overlap_role == 'B':
+                                # Window B samples independently — no temporal seed; the overlap latent blend handles continuity with A.
+                                mask_reft_len = 0
+                            elif current_ref_images is not None:
                                 mask_reft_len = refert_num
                             else:
                                 mask_reft_len = 0 if start == 0 else refert_num
@@ -2650,18 +2656,50 @@ class WanVideoSampler:
                                 offload_transformer(transformer, remove_lora=False)
                                 offloaded = True
 
-                            vae.to(device)
-                            videos = vae.decode(latent[:, 1:].unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
-                            del latent
+                            if iter_overlap_role == 'A':
+                                # Overlap window A: buffer raw latent for later blending with B; skip decode/state/append.
+                                overlap_pending_latent_A = latent.clone()
+                                del latent
+                                sampling_pbar.close()
+                                iteration_count += 1
+                                continue
 
-                            if use_variable_windows:
-                                if not iter_is_first:
-                                    videos = videos[:, refert_num:]
-                                if iter_out_size is not None and videos.shape[1] > iter_out_size:
-                                    videos = videos[:, :iter_out_size]
+                            vae.to(device)
+                            if iter_overlap_role == 'B' and overlap_pending_latent_A is not None:
+                                # Blend A's overlap latents with B's overlap latents, then decode the composite as one pass.
+                                latent_A_post_drop = overlap_pending_latent_A[:, 1:]
+                                latent_B_post_drop = latent[:, 1:]
+                                overlap_pixel_frames = (iter_overlap_end or 0) - (iter_overlap_start or 0)
+                                # Each latent covers ~4 pixel frames (VAE temporal stride = 4). Conservative: cover the pixel overlap fully.
+                                L = max(1, (overlap_pixel_frames + 3) // 4 + 1)
+                                L = min(L, latent_A_post_drop.shape[1], latent_B_post_drop.shape[1])
+                                A_tail = latent_A_post_drop[:, -L:].to(device, vae.dtype)
+                                B_head = latent_B_post_drop[:, :L].to(device, vae.dtype)
+                                _w = torch.linspace(0.0, 1.0, L, device=device, dtype=vae.dtype).view(1, L, 1, 1)
+                                blended = (1.0 - _w) * A_tail + _w * B_head
+                                composite = torch.cat([
+                                    latent_A_post_drop[:, :-L].to(device, vae.dtype),
+                                    blended,
+                                    latent_B_post_drop[:, L:].to(device, vae.dtype),
+                                ], dim=1)
+                                log.info(f"WanAnimate: Blending overlap latents (L={L} latents ~ {overlap_pixel_frames} frames) at output frames {iter_overlap_start}-{iter_overlap_end}")
+                                videos = vae.decode(composite.unsqueeze(0), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
+                                del latent, overlap_pending_latent_A, latent_A_post_drop, latent_B_post_drop, A_tail, B_head, blended, composite
+                                overlap_pending_latent_A = None
+                                # Truncate to total output length — composite may decode to slightly more frames due to VAE quantization.
+                                if videos.shape[1] > total_frames:
+                                    videos = videos[:, :total_frames]
                             else:
-                                if start != 0 or current_ref_images is not None:
-                                    videos = videos[:, refert_num:]
+                                videos = vae.decode(latent[:, 1:].unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
+                                del latent
+                                if use_variable_windows:
+                                    if not iter_is_first:
+                                        videos = videos[:, refert_num:]
+                                    if iter_out_size is not None and videos.shape[1] > iter_out_size:
+                                        videos = videos[:, :iter_out_size]
+                                else:
+                                    if start != 0 or current_ref_images is not None:
+                                        videos = videos[:, refert_num:]
 
                             sampling_pbar.close()
 

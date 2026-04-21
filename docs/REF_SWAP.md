@@ -40,15 +40,13 @@ Adds a new reference image that takes effect at a chosen output frame. Chainable
 | `ref_image` | `IMAGE` | — | New reference image that will drive generation from `swap_frame` onward. Should match the width/height of the original ref. |
 | `swap_frame` | `INT` | `0` | Output frame at which the new reference takes over. The sampler forces a window boundary here and starts using `ref_image` as the static reference from this frame. |
 | `reset_temporal` | `BOOLEAN` | `False` | If `True`, clears the temporal seed from the prior window so the new identity starts cleanly instead of morphing from the old identity's last frame. Use for hard character cuts. Only applied at the full-swap boundary, not during a blended transition. |
-| `transition_frames` | `INT` | `0` | If `> 0`, the sampler inserts N intermediate micro-windows over this many output frames ending at `swap_frame`, each using a linearly-blended ref latent. `0` = hard swap (default). See [Smooth transitions](#smooth-transitions) below. |
-| `transition_steps` | `INT` | `0` | Number of micro-windows for the identity transition. `0` = auto-compute from `transition_frames` (~1 step per 10 frames, no cap). Non-zero overrides. More steps = finer gradient; too many steps shrinks each micro-window and reduces temporal context. |
-| `transition_curve` | enum | `linear` | Weight distribution across the micro-windows. `linear` (evenly spaced), `smoothstep` (concentrates the transition in the middle — slow start/end, fast middle), `ease_in` (slow start, fast end — holds old identity longer), `ease_out` (fast start, slow end — reaches new identity quickly). |
+| `transition_frames` | `INT` | `0` | If `> 0`, two overlapping sampling windows (A with prior ref, B with new ref) are run and their latents are blended over this many output frames **centered on `swap_frame`**. Produces a smooth identity transition. `0` = hard swap (default). V1: only the first transition in a chain is honored. See [Smooth transitions](#smooth-transitions) below. |
 
 **Output:** `image_embeds` — extended dict carrying a sorted `ref_swaps` list. Pass to the next swap node or directly to `WanVideoSampler`.
 
 ### Chaining semantics
 
-Multiple swap nodes produce a list of entries in `image_embeds["ref_swaps"]`, sorted by `swap_frame`. Each entry is `{ref_image, swap_frame, reset_temporal, transition_frames, transition_steps, transition_curve}`. The sampler consumes this list to build a window schedule.
+Multiple swap nodes produce a list of entries in `image_embeds["ref_swaps"]`, sorted by `swap_frame`. Each entry is `{ref_image, swap_frame, reset_temporal, transition_frames}`. The sampler consumes this list to build a window schedule.
 
 ### Requirements
 
@@ -141,63 +139,51 @@ When combined with `transition_frames > 0`, `reset_temporal` is applied **only a
 
 ## Smooth transitions
 
-`transition_frames` lets you dial in a gradual identity shift instead of an abrupt swap. When `> 0`, the sampler subdivides the transition region `[swap_frame - transition_frames, swap_frame)` into **N micro-windows**, each sampled with a blended `ref_latent = (1 - w) · ref_old + w · ref_new`. The blend happens in VAE latent space — the denoiser's own conditioning shifts as identity — not in pixel space (pixel-space cross-fades produce ghosting at mid weights on different characters, so we don't do that).
+`transition_frames` produces a gradual identity shift by running **two independent overlapping sampling windows** and blending their latents on the overlap region before a single VAE decode.
 
-- `N = transition_steps` if the input is non-zero, otherwise `max(1, round(transition_frames / 10))` (no cap).
-- `N = min(N, transition_frames)` — can't have more steps than frames.
-- Each micro-window `k ∈ [0, N)` covers `transition_frames / N` output frames and uses weight `w_k = curve((k+1) / (N+1))`, where `curve` is one of `linear` / `smoothstep` / `ease_in` / `ease_out` per the `transition_curve` input.
-- The post-transition window starts exactly at `swap_frame` with `apply_weight = 1.0`. `ref_latent` is permanently replaced by the new ref here, and `reset_temporal` (if set) fires.
-- `ref_latent` is **not** overwritten during blend windows, so subsequent blend windows keep interpolating between the original pre-swap latent and the fully-new latent.
+Mechanism:
 
-Compute cost is ~1× — same as a normal swap. Each micro-window is a full sampling window (not two passes).
+1. **Window A** samples with the **prior** ref. Its range: `[0, swap_frame + transition_frames/2)`.
+2. **Window B** samples with the **new** ref. Its range: `[swap_frame - transition_frames/2, total_frames)`.
+3. The two windows **overlap** for `transition_frames` frames centered on `swap_frame`.
+4. After both sample, we blend the ~`transition_frames/4 + 1` latents at the overlap with a linear 0→1 ramp. A's pre-overlap latents + blended overlap + B's post-overlap latents form a single composite latent tensor.
+5. VAE decodes the composite **once**, truncated to `total_frames`.
 
-### Worked example — latent-blend transition
+Window A and Window B each produce a **coherent full-length generation** with full temporal attention context inside. The blend combines two coherent signals at their overlap, rather than trying to smooth identity inside a narrow region with limited context.
 
-`num_frames=50` (→ 53 after `AVHandlesAdd`), `swap_frame=25`, `transition_frames=20`, `transition_steps=10`, `transition_curve=smoothstep`, `frame_window_size=77`:
+Compute cost: approximately 2× sampling in the overlap region (each window covers its full range independently), but only 1× VAE decode (of the composite).
 
-`N = 10` micro-windows of 2 frames each, covering `[5, 25)`. Boundaries from `{0, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 53}`.
+### Worked example
 
-Smoothstep weights: `[0.028, 0.104, 0.216, 0.352, 0.500, 0.648, 0.784, 0.896, 0.972, 0.993]` (roughly).
+`num_frames=100, swap_frame=50, transition_frames=20, frame_window_size=77`:
 
-| iter | window | target | `apply_weight` | ref_latent used |
-|------|--------|--------|----------------|-----------------|
-| 0 | `(0, 5)` | — | 0.0 | `ref_A` (original) |
-| 1 | `(5, 7)` | swap 0 | 0.028 | `0.972·A + 0.028·B` |
-| 2 | `(7, 9)` | swap 0 | 0.104 | `0.896·A + 0.104·B` |
-| 3 | `(9, 11)` | swap 0 | 0.216 | `0.784·A + 0.216·B` |
-| 4 | `(11, 13)` | swap 0 | 0.352 | `0.648·A + 0.352·B` |
-| 5 | `(13, 15)` | swap 0 | 0.500 | `0.500·A + 0.500·B` |
-| 6 | `(15, 17)` | swap 0 | 0.648 | `0.352·A + 0.648·B` |
-| 7 | `(17, 19)` | swap 0 | 0.784 | `0.216·A + 0.784·B` |
-| 8 | `(19, 21)` | swap 0 | 0.896 | `0.104·A + 0.896·B` |
-| 9 | `(21, 23)` | swap 0 | 0.972 | `0.028·A + 0.972·B` |
-| 10 | `(23, 25)` | swap 0 | 0.993 | `0.007·A + 0.993·B` |
-| 11 | `(25, 53)` | swap 0 | 1.0 | `ref_B` (persisted; `reset_temporal` applies here if set) |
+- Window A: `[0, 60)` with `ref_A` (60 frames).
+- Window B: `[40, 100)` with `ref_B` (60 frames).
+- Overlap: `[40, 60)` — 20 frames.
+- Latent structure (assuming `cur_lws_A = cur_lws_B = 16` after VAE alignment):
+  - A's post-drop latents: 16 latents covering ≈61 output frames.
+  - B's post-drop latents: 16 latents covering ≈61 output frames.
+  - L = `(20 + 3) // 4 + 1 = 6` latents blended (covers the ~20 overlap frames).
+  - Composite: A's first 10 latents + 6 blended latents + B's last 10 latents = 26 latents → decode to 101 frames → truncate to 100.
 
 Expected log output during sampling:
 ```
-WanAnimate: variable-window schedule with 12 windows from 1 swap(s): [(0, 5, -1, 0.0), (5, 7, 0, 0.028), (7, 9, 0, 0.104), ..., (23, 25, 0, 0.993), (25, 53, 0, 1.0)]
+WanAnimate: variable-window schedule with 2 windows from 1 swap(s): [(0, 60, -1, 1.0, 'A'), (40, 100, 0, 1.0, 'B')]
 WanAnimate: Encoded new ref for swap idx 0
-WanAnimate: Blending toward ref swap idx 0 at weight 0.028 (window 5-7)
-WanAnimate: Blending toward ref swap idx 0 at weight 0.104 (window 7-9)
-...
-WanAnimate: Applying ref swap idx 0 fully (window starts at output frame 25, requested swap_frame 25)
+WanAnimate: Applying ref swap idx 0 fully (window starts at output frame 40, ...)
+WanAnimate: Blending overlap latents (L=6 latents ~ 20 frames) at output frames 40-60
 ```
 
-### Picking `transition_steps`
-
-- **`0` (default)**: auto `round(transition_frames / 10)`. Good for rough-and-ready — quick morphs over short regions.
-- **Match `transition_frames`**: one micro-window per frame. Finest possible gradient, but each micro-window is 1 frame and has almost no temporal attention context. Quality degrades.
-- **~half of `transition_frames`**: 2-frame micro-windows. Nice balance — smooth gradient, model still has a little temporal context per step.
-- **Large transitions (50+ frames)**: 5-10 steps is usually plenty.
+Output: 100 frames. Frames 0-39 are pure ref A. Frames 40-59 are a smooth latent blend between A's old-identity continuation and B's independent generation. Frames 60-99 are pure ref B.
 
 ### Transition caveats
 
-- **Latent linear interpolation isn't visually guaranteed.** For similar poses and lighting, the blend produces a smooth identity shift. For drastically different subjects (different species / pose / lighting / camera angle), the intermediate latents can look noisy. For those cases, the only alternative is chained manual intermediates — generate morph frames externally (FILM / RIFE / image-morph tools) and chain multiple `WanVideoAnimateRefSwap` nodes at close frames.
-- **Very short micro-windows reduce temporal context.** Each micro-window is an independent sampling window. Windows under ~5 frames give the transformer very little to work with. Balance `transition_steps` against window quality.
-- **VAE temporal quantization rounds window sizes up.** Each micro-window is sampled at the nearest `4k+1` frame count and truncated, so a 2-frame micro-window samples 5 frames internally. Not a correctness issue; just extra compute.
-- **Overlapping transitions are not supported.** If two swaps' transition regions would overlap, the sampler logs a warning and drops the later swap's transition.
-- **`reset_temporal`** applies only at the full-swap boundary window (`apply_weight = 1.0`), never during blend windows.
+- **V1 supports exactly one swap with `transition_frames > 0`.** If multiple swap nodes each set `transition_frames > 0`, only the first one in the chain is honored (overlap A/B pair); the others become hard swaps with a warning logged. Chaining multiple overlap crossfades across windows is out of scope for V1.
+- **Both windows must fit in `frame_window_size`.** With default `frame_window_size=77`, the video and transition must be small enough that window A `[0, swap + trans/2)` and window B `[swap - trans/2, total_frames)` each fit in 77 frames. If not, `transition_frames` is clamped with a warning (or dropped entirely if clamping to zero).
+- **Latent blending uses per-latent weights, not per-frame.** Each latent covers ~4 pixel frames (VAE temporal stride), so a 20-frame transition has ~6 latent steps. Smoother than any prior approach but not strictly per-frame linear.
+- **Window B doesn't use a temporal seed.** Its `mask_reft_len` is forced to 0 — it generates independently starting from noise rather than extending from A's frame. The latent blend on the overlap handles the continuity.
+- **`reset_temporal=True` during a transition** fires at window B's swap-apply boundary, but its effect is weaker than a hard-cut because the output is the blended composite. For a truly hard cut, use `transition_frames=0` + `reset_temporal=True`.
+- **Auto-convert, mask extraction, and all other looping features** (`fad4a3e`, `542c1b5`, `58b8a3a`) still apply and compose with this transition path.
 - **Clamped at frame 0.** If `swap_frame - transition_frames < 0`, the transition starts at frame 0 and is truncated.
 - **Fallback mode ignores it.** `transition_frames` has no effect when the sampler falls back to fixed windows (see [Fallback rules](#fallback-rules)).
 

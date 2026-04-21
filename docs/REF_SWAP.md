@@ -236,5 +236,6 @@ The swap code path uses the sampler-local `vae_upscale_factor` (16 for Wan 5B, 8
 - `58b8a3a` — support masked Embeds in the variable-window path; `_convert_to_looping` extracts `bg_mask` from the non-looping combined `ref_latent`, sampler gating drops the `wananim_ref_masks is None` requirement, and per-iter `start_latent` / `end_latent` are computed for correct mask slicing.
 - `2eb7c5e` — replace `transition_frames` latent-blend micro-windows with pixel-space cross-fade (A/B sibling iterations, shared noise, per-frame smoothstep blend). Per-frame smooth; 2× compute in the transition region only. **Reverted in `0752487`** — pixel cross-fade ghosts at mid weights on different identities.
 - `0752487` — revert the pixel cross-fade; restore latent-blend transition with `transition_steps` (no N=5 cap) and `transition_curve` (linear / smoothstep / ease_in / ease_out) tuning controls.
+- `b651eec` — **complete redesign**: replace micro-window blending with two independent overlapping sampling windows (A with old ref, B with new ref), latent-blend the overlap, single VAE decode. `transition_steps` and `transition_curve` inputs removed. V1 supports one transition per workflow.
 
 Keep this doc in sync whenever new behavior lands.
